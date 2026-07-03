@@ -1,6 +1,4 @@
-import redisClients from "../redis/redisClient.js";
-
-const { redisClient } = redisClients;
+import { redisClient } from "../redis/redisClient.js";
 
 export const getOrderById = async (req, res) => {
   const { id } = req.params;

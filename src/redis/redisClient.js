@@ -1,27 +1,35 @@
 import { createClient } from "redis";
 import dotenv from "dotenv";
+
 dotenv.config();
 
-const REDIS_HOST = process.env.REDIS_HOST;
-const REDIS_PORT = process.env.REDIS_PORT;
-
-export const redisClient = createClient({
-    host:"0.0.0.0",
-  url: `redis://${REDIS_HOST}:${REDIS_PORT}`
+const redisClient = createClient({
+  socket: {
+    host: process.env.REDIS_HOST || "127.0.0.1",
+    port: Number(process.env.REDIS_PORT) || 6379,
+    connectTimeout: 5000,
+  },
 });
 
-export const redisSubscriber = createClient({
-  url: `redis://${REDIS_HOST}:${REDIS_PORT}`
+const redisSubscriber = createClient({
+  socket: {
+    host: process.env.REDIS_HOST || "127.0.0.1",
+    port: Number(process.env.REDIS_PORT) || 6379,
+    connectTimeout: 5000,
+  },
 });
 
+redisClient.on("error", (err) =>
+  console.error("❌ Redis Client Error:", err)
+);
 
-// Connect
-redisClient.on("error", (err) => console.error("Redis Error:", err));
-redisSubscriber.on("error", (err) => console.error("Redis Sub Error:", err));
+redisSubscriber.on("error", (err) =>
+  console.error("❌ Redis Subscriber Error:", err)
+);
 
 await redisClient.connect();
 await redisSubscriber.connect();
 
-console.log("Redis Clients Ready");
+console.log("✅ Redis Clients Ready");
 
-export default { redisClient, redisSubscriber };
+export { redisClient, redisSubscriber };
