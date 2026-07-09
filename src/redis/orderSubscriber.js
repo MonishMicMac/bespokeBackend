@@ -8,3 +8,11 @@ await redisSubscriber.subscribe("order-list", (message) => {
 
   sendOrderCreatedEvent(data);
 });
+
+await redisSubscriber.subscribe("test-channel", (message) => {
+  const data = JSON.parse(message);
+
+  console.log("📩 Redis Job Received (test-channel):", data);
+
+  sendOrderCreatedEvent(data);
+});

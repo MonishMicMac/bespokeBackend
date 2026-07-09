@@ -9,6 +9,7 @@ const redisClient = createClient({
     port: Number(process.env.REDIS_PORT) || 6379,
     connectTimeout: 5000,
   },
+  password: process.env.REDIS_PASSWORD || undefined
 });
 
 const redisSubscriber = createClient({
@@ -17,6 +18,7 @@ const redisSubscriber = createClient({
     port: Number(process.env.REDIS_PORT) || 6379,
     connectTimeout: 5000,
   },
+  password: process.env.REDIS_PASSWORD || undefined
 });
 
 redisClient.on("error", (err) =>

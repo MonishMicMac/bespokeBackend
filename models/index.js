@@ -52,6 +52,4 @@ const Message = sequelize.define(
 // Create the table
 await Message.sync({ alter: true });
 
-console.log("✅ Chat table synchronized");
-
 export default Message;

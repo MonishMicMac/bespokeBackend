@@ -9,6 +9,7 @@ import "./redis/orderSubscriber.js"; // Listen to Redis Jobs
 import { initSocket } from "./sockets/socket.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
+import signupRoutes from "./routes/signupRoutes.js";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -33,6 +34,7 @@ app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 app.use("/api", orderRoutes);
 app.use("/api/chat", chatRoutes);
+app.use("/api/vendor", signupRoutes);
 
 
 const io = new Server(server, {
