@@ -3,6 +3,8 @@ import http from "http";
 import { Server } from "socket.io";
 import sequelize from "../config/db.js";
 import Chat from "../models/index.js";
+import SaleOrderHistory from "../models/SaleOrderHistory.js";
+import SaleOrder from "../models/SaleOrder.js";
 import cors from "cors";
 
 import "./redis/orderSubscriber.js"; // Listen to Redis Jobs
@@ -10,6 +12,7 @@ import { initSocket } from "./sockets/socket.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
 import signupRoutes from "./routes/signupRoutes.js";
+import saleOrderRoutes from "./routes/saleOrderRoutes.js";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -33,6 +36,8 @@ const server = http.createServer(app);
 app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 app.use("/api", orderRoutes);
+app.use("/api/vendor", orderRoutes);
+app.use("/api/vendor", saleOrderRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/vendor", signupRoutes);
 

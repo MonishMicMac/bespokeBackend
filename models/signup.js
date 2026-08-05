@@ -19,7 +19,6 @@ const UserLogin = sequelize.define(
     },
     mobile: {
       type: DataTypes.STRING,
-      allowNull: false,
       unique: true,
     },
     email: {
@@ -92,11 +91,11 @@ const UserLogin = sequelize.define(
     },
   },
   {
-    tableName: "user_login",
+    tableName: "vendor_login",
     timestamps: false,
   }
 );
 
-await UserLogin.sync({ alter: true });
+await UserLogin.sync();
 
 export default UserLogin;

@@ -1,5 +1,6 @@
 import User from "../../models/signup.js";
 import crypto from "crypto";
+import { sendMail } from "../services/mailService.js";
 
 export const signup = async (req, res) => {
 
@@ -20,7 +21,6 @@ export const signup = async (req, res) => {
             });
         }
 
-        // Encrypt password
 
         // Save user
         const newUser = await User.create({
@@ -32,6 +32,19 @@ export const signup = async (req, res) => {
             gst_no,
             pan_no
         });
+
+        // Send welcome email
+        try {
+            await sendMail(
+                email,
+                "Welcome to Bespoke!",
+                `<h2>Welcome ${username}!</h2><p>Your registration as a vendor on Bespoke was successful.</p>`
+            );
+            console.log(`📨 Welcome email sent to ${email}`);
+        } catch (mailErr) {
+            console.error("❌ Failed to send welcome email:", mailErr);
+            // We do not fail the request if just the email fails, but we log the error
+        }
 
         return res.status(201).json({
             success: true,

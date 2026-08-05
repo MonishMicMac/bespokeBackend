@@ -9,10 +9,12 @@ await redisSubscriber.subscribe("order-list", (message) => {
   sendOrderCreatedEvent(data);
 });
 
+// Subscribe to test-channel
 await redisSubscriber.subscribe("test-channel", (message) => {
-  const data = JSON.parse(message);
-
-  console.log("📩 Redis Job Received (test-channel):", data);
-
-  sendOrderCreatedEvent(data);
+  try {
+    const data = JSON.parse(message);
+    console.log("📩 Redis Job Received (test-channel):", data);
+  } catch (e) {
+    console.error("Failed to parse test-channel message as JSON:", e.message);
+  }
 });
