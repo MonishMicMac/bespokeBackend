@@ -1,0 +1,30 @@
+name: Deploy Node.js Backend to EC2
+
+on:
+  push:
+    branches:
+      - main # Triggers automatically when you push to main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 1. Navigate to the Node.js backend directory
+            cd /var/www/node-app
+            
+            # 2. Pull the latest code from GitHub
+            git pull origin main
+            
+            # 3. Install any new dependencies
+            npm install
+            
+            # 4. Restart the Node server using PM2
+            # Make sure this name exactly matches the name you gave it in PM2
+            pm2 restart node-backend
