@@ -49,7 +49,4 @@ const Message = sequelize.define(
   }
 );
 
-// Create the table
-await Message.sync({ alter: true });
-
 export default Message;

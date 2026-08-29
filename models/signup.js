@@ -96,6 +96,4 @@ const UserLogin = sequelize.define(
   }
 );
 
-await UserLogin.sync();
-
 export default UserLogin;

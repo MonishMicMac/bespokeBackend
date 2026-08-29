@@ -165,5 +165,4 @@ const SaleOrder = sequelize.define(
   }
 );
 
-await SaleOrder.sync({ alter: true });
 export default SaleOrder;

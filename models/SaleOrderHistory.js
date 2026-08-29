@@ -34,5 +34,4 @@ const SaleOrderHistory = sequelize.define(
   }
 );
 
-await SaleOrderHistory.sync({ alter: true });
 export default SaleOrderHistory;
