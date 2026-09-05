@@ -1,8 +1,8 @@
 import { DataTypes } from "sequelize";
 import sequelize from "../config/db.js";
 
-const UserLogin = sequelize.define(
-  "UserLogin",
+const VendorLogin = sequelize.define(
+  "VendorLogin",
   {
     id: {
       type: DataTypes.BIGINT,
@@ -147,4 +147,4 @@ const UserLogin = sequelize.define(
   }
 );
 
-export default UserLogin;
+export default VendorLogin;

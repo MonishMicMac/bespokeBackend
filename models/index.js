@@ -24,7 +24,17 @@ const Message = sequelize.define(
     chatType: {
         type: DataTypes.STRING,
         defaultValue: "private",
-        },
+    },
+    senderType: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+      defaultValue: null,
+    },
+    receiverType: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+      defaultValue: null,
+    },
     messageType: {
       type: DataTypes.ENUM("text", "image", "file"),
       defaultValue: "text",
