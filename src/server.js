@@ -13,10 +13,10 @@ import orderRoutes from "./routes/orderRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
 import signupRoutes from "./routes/signupRoutes.js";
 import saleOrderRoutes from "./routes/saleOrderRoutes.js";
+import refundRoutes from "./routes/refundRoutes.js";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -40,6 +40,8 @@ app.use("/api/vendor", orderRoutes);
 app.use("/api/vendor", saleOrderRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/vendor", signupRoutes);
+app.use("/api/vendor", refundRoutes);
+
 
 
 const io = new Server(server, {
