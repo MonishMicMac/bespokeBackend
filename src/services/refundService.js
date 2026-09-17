@@ -1,10 +1,19 @@
 import Razorpay from "razorpay";
 import crypto from "crypto";
 
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY,
-    key_secret: process.env.RAZORPAY_SECRET,
-});
+const getRazorpayInstance = () => {
+    const key_id = process.env.RAZORPAY_KEY || process.env.RAZORPAY_KEY_ID;
+    const key_secret = process.env.RAZORPAY_SECRET || process.env.RAZORPAY_KEY_SECRET;
+
+    if (!key_id || !key_secret) {
+        throw new Error("Razorpay credentials not configured. Please set RAZORPAY_KEY and RAZORPAY_SECRET in your .env file.");
+    }
+
+    return new Razorpay({
+        key_id,
+        key_secret,
+    });
+};
 
 export const createRefund = async ({
     paymentId,
@@ -28,6 +37,7 @@ export const createRefund = async ({
         speed: "normal",
     };
 
+    const razorpay = getRazorpayInstance();
     const refund = await razorpay.payments.refund(paymentId, params);
 
     return refund;

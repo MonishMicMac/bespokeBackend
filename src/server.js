@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -14,13 +15,10 @@ import chatRoutes from "./routes/chatRoutes.js";
 import signupRoutes from "./routes/signupRoutes.js";
 import saleOrderRoutes from "./routes/saleOrderRoutes.js";
 import refundRoutes from "./routes/refundRoutes.js";
-import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-dotenv.config();
 
 const app = express();
 const corsOptions = {
