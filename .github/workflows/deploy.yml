@@ -27,4 +27,4 @@ jobs:
             
             # 4. Restart the Node server using PM2
             # Make sure this name exactly matches the name you gave it in PM2
-            pm2 restart node-backend
+            pm2 restart node-api
