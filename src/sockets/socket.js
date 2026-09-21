@@ -15,14 +15,35 @@ function broadcastOnlineUsers() {
 export function initSocket(io) {
   ioInstance = io;
 
+  function registerUser(socket, userId) {
+    if (!userId) return;
+    const strId = String(userId);
+    const cleanId = strId.replace(/^(vendor_|customer_)/, "");
+
+    connectedUsers[strId] = socket.id;
+    connectedUsers[cleanId] = socket.id;
+    connectedUsers[`vendor_${cleanId}`] = socket.id;
+
+    // Join rooms for multi-tab and room-based emitting
+    socket.join(strId);
+    socket.join(cleanId);
+    socket.join(`vendor_${cleanId}`);
+
+    console.log(`User/Vendor ${strId} (clean: ${cleanId}) registered with socket ${socket.id}`);
+    io.emit("user_status", { userId: strId, status: "online" });
+    broadcastOnlineUsers();
+  }
+
   io.on("connection", (socket) => {
-    // Register Users on Connect
+    // Automatically register if userId passed in query params (e.g. io(url, { query: { userId } }))
+    const queryUserId = socket.handshake.query?.userId;
+    if (queryUserId) {
+      registerUser(socket, queryUserId);
+    }
+
+    // Register Users on explicit Connect event
     socket.on("register", (userId) => {
-      connectedUsers[userId] = socket.id;
-      console.log(`User ${userId} connected with socket ${socket.id}`);
-      // Notify all clients that this user is online
-      io.emit("user_status", { userId, status: "online" });
-      broadcastOnlineUsers();
+      registerUser(socket, userId);
     });
 
     // Send the list of currently online users to the requesting client
@@ -142,10 +163,37 @@ export function emitToAll(event, data) {
 
 export function emitToUser(userId, event, data) {
   if (ioInstance) {
-    const socketId = connectedUsers[userId];
+    const strId = String(userId);
+    const cleanId = strId.replace(/^(vendor_|customer_)/, "");
+    ioInstance.to(strId).emit(event, data);
+    ioInstance.to(cleanId).emit(event, data);
+    const socketId = connectedUsers[strId] || connectedUsers[cleanId];
     if (socketId) {
       ioInstance.to(socketId).emit(event, data);
     }
+  }
+}
+
+export function emitToVendor(vendorId, event, data) {
+  if (!ioInstance) {
+    console.warn("⚠️ Cannot emit to vendor, ioInstance is not initialized");
+    return;
+  }
+
+  const strId = String(vendorId);
+  const cleanId = strId.replace(/^(vendor_|customer_)/, "");
+
+  console.log(`📢 Emitting '${event}' to vendor ${cleanId} (rooms: vendor_${cleanId}, ${cleanId})`);
+
+  // Emit to socket rooms (supports multiple browser tabs / devices for same vendor)
+  ioInstance.to(`vendor_${cleanId}`).emit(event, data);
+  ioInstance.to(cleanId).emit(event, data);
+  ioInstance.to(strId).emit(event, data);
+
+  // Also emit to direct socket ID if registered in connectedUsers
+  const directSocketId = connectedUsers[cleanId] || connectedUsers[`vendor_${cleanId}`] || connectedUsers[strId];
+  if (directSocketId) {
+    ioInstance.to(directSocketId).emit(event, data);
   }
 }
 function buildFileUrl(path) {
