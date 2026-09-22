@@ -17,6 +17,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1079.0",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "firebase-admin": "^14.4.0",
     "multer": "^2.2.0",
     "mysql2": "^3.22.5",
     "nodemailer": "^9.0.3",

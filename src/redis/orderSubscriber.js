@@ -1,5 +1,20 @@
-import { sendOrderCreatedEvent, sendVendorNotificationEvent } from "../events/orderEvents.js";
+import {
+  sendOrderCreatedEvent,
+  sendVendorNotificationEvent,
+  sendAdminNotificationEvent,
+} from "../events/orderEvents.js";
 import { redisSubscriber } from "./redisClient.js";
+
+// Subscribe to admin-notifications channel
+await redisSubscriber.subscribe("admin-notifications", (message) => {
+  try {
+    const payload = JSON.parse(message);
+    console.log("📩 Redis Event Received (admin-notifications):", payload);
+    sendAdminNotificationEvent(payload);
+  } catch (err) {
+    console.error("❌ Failed to parse admin-notifications message as JSON:", err.message);
+  }
+});
 
 // Subscribe to vendor-notifications channel (published by Laravel)
 await redisSubscriber.subscribe("vendor-notifications", (message) => {
@@ -33,4 +48,5 @@ await redisSubscriber.subscribe("test-channel", (message) => {
   }
 });
 
-console.log("✅ Redis Subscriber active for channels: vendor-notifications, order-list, test-channel");
+console.log("✅ Redis Subscriber active for channels: admin-notifications, vendor-notifications, order-list, test-channel");
+

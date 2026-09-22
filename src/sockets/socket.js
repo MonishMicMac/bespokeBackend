@@ -19,18 +19,24 @@ export function initSocket(io) {
   function registerUser(socket, userId) {
     if (!userId) return;
     const strId = String(userId);
-    const cleanId = strId.replace(/^(vendor_|customer_)/, "");
+    const cleanId = strId.replace(/^(vendor_|customer_|admin_)/, "");
 
     connectedUsers[strId] = socket.id;
     connectedUsers[cleanId] = socket.id;
     connectedUsers[`vendor_${cleanId}`] = socket.id;
+
+    if (strId.toLowerCase().includes("admin") || cleanId.toLowerCase() === "admin") {
+      connectedUsers["admin"] = socket.id;
+      socket.join("admin");
+      socket.join("admin_room");
+    }
 
     // Join rooms for multi-tab and room-based emitting
     socket.join(strId);
     socket.join(cleanId);
     socket.join(`vendor_${cleanId}`);
 
-    console.log(`User/Vendor ${strId} (clean: ${cleanId}) registered with socket ${socket.id}`);
+    console.log(`User/Vendor/Admin ${strId} (clean: ${cleanId}) registered with socket ${socket.id}`);
     io.emit("user_status", { userId: strId, status: "online" });
     broadcastOnlineUsers();
   }
@@ -45,6 +51,14 @@ export function initSocket(io) {
     // Register Users on explicit Connect event
     socket.on("register", (userId) => {
       registerUser(socket, userId);
+    });
+
+    // Explicit Admin join event
+    socket.on("join_admin", () => {
+      socket.join("admin");
+      socket.join("admin_room");
+      connectedUsers["admin"] = socket.id;
+      console.log(`🛡️ Socket ${socket.id} joined admin room`);
     });
 
     // Send the list of currently online users to the requesting client
@@ -193,6 +207,25 @@ export function emitToVendor(vendorId, event, data) {
 
   // Also emit to direct socket ID if registered in connectedUsers
   const directSocketId = connectedUsers[cleanId] || connectedUsers[`vendor_${cleanId}`] || connectedUsers[strId];
+  if (directSocketId) {
+    ioInstance.to(directSocketId).emit(event, data);
+  }
+}
+
+export function emitToAdmin(event, data) {
+  if (!ioInstance) {
+    console.warn("⚠️ Cannot emit to admin, ioInstance is not initialized");
+    return;
+  }
+
+  console.log(`🛡️ Emitting '${event}' to admin room`);
+
+  // Emit to admin rooms
+  ioInstance.to("admin").emit(event, data);
+  ioInstance.to("admin_room").emit(event, data);
+
+  // Also emit to direct socket ID if registered in connectedUsers under admin
+  const directSocketId = connectedUsers["admin"] || connectedUsers["admin_1"];
   if (directSocketId) {
     ioInstance.to(directSocketId).emit(event, data);
   }
