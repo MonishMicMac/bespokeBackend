@@ -27,9 +27,20 @@ router.put("/mark-read", markMessagesAsRead);
 
 // POST /api/chat/upload
 router.post(
-    "/upload",
-    upload.single("image"),
-    uploadImage
+  "/upload",
+  (req, res, next) => {
+    upload.any()(req, res, (err) => {
+      if (err) {
+        console.error("Multer upload error:", err);
+        return res.status(400).json({ success: false, error: err.message });
+      }
+      if (req.files && req.files.length > 0) {
+        req.file = req.files[0];
+      }
+      next();
+    });
+  },
+  uploadImage
 );
 
 // DELETE /api/chat/message/:id

@@ -132,9 +132,12 @@ export const markMessagesAsRead = async (req, res) => {
 
 export const uploadImage = async (req, res) => {
   try {
-    console.log(req.file);
+    const file = req.file || (req.files && req.files[0]);
+    if (!file) {
+      return res.status(400).json({ success: false, error: "No file provided. Field name can be 'image' or 'file'." });
+    }
 
-    const key = await s3ImageUploader(req.file);
+    const key = await s3ImageUploader(file);
     const imageUrl = buildFileUrl(key);
 
     res.json({
@@ -143,7 +146,7 @@ export const uploadImage = async (req, res) => {
       imageKey: key,
     });
   } catch (err) {
-    console.error(err);
+    console.error("Error uploading image:", err);
 
     res.status(500).json({
       success: false,
