@@ -15,6 +15,7 @@ import chatRoutes from "./routes/chatRoutes.js";
 import signupRoutes from "./routes/signupRoutes.js";
 import saleOrderRoutes from "./routes/saleOrderRoutes.js";
 import refundRoutes from "./routes/refundRoutes.js";
+import notificationRoutes from "./routes/notificationRoutes.js";
 import path from "path";
 import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
@@ -24,7 +25,7 @@ const app = express();
 const corsOptions = {
   origin: true,
   credentials: true, // This allows cookies to be sent/received
-  methods: ["GET", "POST", "PUT", "DELETE"], // Allowed methods
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"], // Allowed methods
   allowedHeaders: ["Content-Type", "Authorization"], // Allowed headers
 };
 
@@ -40,6 +41,9 @@ app.use("/api/chat", chatRoutes);
 app.use("/chat", chatRoutes);
 app.use("/api/vendor", signupRoutes);
 app.use("/api/vendor", refundRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/vendor/notifications", notificationRoutes);
+
 
 
 
