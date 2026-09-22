@@ -43,6 +43,9 @@ app.use("/api/vendor", signupRoutes);
 app.use("/api/vendor", refundRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/vendor/notifications", notificationRoutes);
+app.use("/notifications", notificationRoutes);
+app.use("/vendor/notifications", notificationRoutes);
+
 
 
 
