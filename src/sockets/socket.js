@@ -1,4 +1,5 @@
 import Message from "../../models/index.js";
+import { buildFileUrl } from "../utils/fileUrl.js";
 
 let ioInstance = null;
 
@@ -196,13 +197,5 @@ export function emitToVendor(vendorId, event, data) {
     ioInstance.to(directSocketId).emit(event, data);
   }
 }
-function buildFileUrl(path) {
-  if (!path) return path;
 
-  if (path.startsWith("http")) {
-    return path;
-  }
-
-  return `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/${encodeURI(path)}`;
-}
 

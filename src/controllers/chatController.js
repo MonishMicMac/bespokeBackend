@@ -5,6 +5,7 @@ import { Op } from "sequelize";
 import { emitToUser } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import s3ImageUploader from "../services/S3service.js";
+import { buildFileUrl } from "../utils/fileUrl.js";
 export const getChatHistory = async (req, res) => {
 
 
@@ -41,7 +42,19 @@ export const getChatHistory = async (req, res) => {
     // Reverse them to be in chronological order for the frontend
     messages.reverse();
 
-    res.status(200).json(messages);
+    const formattedMessages = messages.map((msg) => {
+      const msgData = msg.toJSON ? msg.toJSON() : { ...msg };
+      if (
+        msgData.messageType === "image" ||
+        msgData.messageType === "file" ||
+        (typeof msgData.message === "string" && msgData.message.startsWith("chatUploads/"))
+      ) {
+        msgData.message = buildFileUrl(msgData.message);
+      }
+      return msgData;
+    });
+
+    res.status(200).json(formattedMessages);
   } catch (error) {
     console.error("Error fetching chat history:", error);
     res.status(500).json({ error: "Failed to fetch chat history" });
@@ -81,6 +94,14 @@ export const sendMessage = async (req, res) => {
 
     const messageData = savedMessage.toJSON();
 
+    if (
+      messageData.messageType === "image" ||
+      messageData.messageType === "file" ||
+      (typeof messageData.message === "string" && messageData.message.startsWith("chatUploads/"))
+    ) {
+      messageData.message = buildFileUrl(messageData.message);
+    }
+
     // Emit via socket to receiver if connected
     emitToUser(String(receiverId), "receive_message", messageData);
 
@@ -113,11 +134,13 @@ export const uploadImage = async (req, res) => {
   try {
     console.log(req.file);
 
-    const imageUrl = await s3ImageUploader(req.file);
+    const key = await s3ImageUploader(req.file);
+    const imageUrl = buildFileUrl(key);
 
     res.json({
       success: true,
       imageUrl,
+      imageKey: key,
     });
   } catch (err) {
     console.error(err);
