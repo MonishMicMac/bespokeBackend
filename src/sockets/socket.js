@@ -88,14 +88,13 @@ export function initSocket(io) {
           status: initialStatus,
       });
       const messageData = savedMessage.toJSON();
-
-if (messageData.messageType === "image") {
-  messageData.message = buildFileUrl(messageData.message);
-}
-   console.log(messageData)
-      if (receiverSocketId) {
-          io.to(receiverSocketId).emit("receive_message", messageData);
+      if (messageData.messageType === "image") {
+        messageData.message = buildFileUrl(messageData.message);
       }
+      console.log("Emitting message data:", messageData);
+
+      // Emit to receiver using room and socket routing (supports customer, vendor, admin)
+      emitToUser(data.receiverId, "receive_message", messageData);
  
 
 
@@ -179,10 +178,20 @@ export function emitToAll(event, data) {
 export function emitToUser(userId, event, data) {
   if (ioInstance) {
     const strId = String(userId);
-    const cleanId = strId.replace(/^(vendor_|customer_)/, "");
+    const cleanId = strId.replace(/^(vendor_|customer_|admin_)/, "");
     ioInstance.to(strId).emit(event, data);
     ioInstance.to(cleanId).emit(event, data);
-    const socketId = connectedUsers[strId] || connectedUsers[cleanId];
+
+    if (strId.toLowerCase().includes("admin") || cleanId.toLowerCase() === "admin") {
+      ioInstance.to("admin").emit(event, data);
+      ioInstance.to("admin_room").emit(event, data);
+    }
+
+    const socketId =
+      connectedUsers[strId] ||
+      connectedUsers[cleanId] ||
+      (strId.toLowerCase().includes("admin") ? connectedUsers["admin"] : null);
+
     if (socketId) {
       ioInstance.to(socketId).emit(event, data);
     }

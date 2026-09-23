@@ -6,9 +6,19 @@ import { emitToUser } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import s3ImageUploader from "../services/S3service.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
+export const getUserVariations = (id) => {
+  if (!id) return [];
+  const strId = String(id).trim();
+  const cleanId = strId.replace(/^(customer_|vendor_|admin_)/, "");
+  const variations = new Set([strId, cleanId]);
+  if (/^\d+$/.test(cleanId)) {
+    variations.add(`customer_${cleanId}`);
+    variations.add(`vendor_${cleanId}`);
+  }
+  return Array.from(variations);
+};
+
 export const getChatHistory = async (req, res) => {
-
-
   const { userId, otherUserId } = req.params;
   const { chatType } = req.query;
   const page = parseInt(req.query.page, 10) || 1;
@@ -18,17 +28,27 @@ export const getChatHistory = async (req, res) => {
   console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, page: ${page}, limit: ${limit}, chatType: ${chatType || 'all'}`);
 
   try {
+    const userVariations = getUserVariations(userId);
+    const otherVariations = getUserVariations(otherUserId);
+    const safeUserId = String(userId).replace(/[^a-zA-Z0-9_-]/g, "");
+
     const whereConditions = [
       {
         [Op.or]: [
-          { senderId: userId, receiverId: otherUserId },
-          { senderId: otherUserId, receiverId: userId },
+          {
+            senderId: { [Op.in]: userVariations },
+            receiverId: { [Op.in]: otherVariations },
+          },
+          {
+            senderId: { [Op.in]: otherVariations },
+            receiverId: { [Op.in]: userVariations },
+          },
         ],
       },
-      sequelize.literal(`JSON_EXTRACT(IFNULL(deletedmsges, '{}'), '$."${userId}"') IS NULL`)
+      sequelize.literal(`JSON_EXTRACT(IFNULL(deletedmsges, '{}'), '$."${safeUserId}"') IS NULL`)
     ];
 
-    if (chatType) {
+    if (chatType && chatType !== 'all') {
       whereConditions.push({ chatType });
     }
 
@@ -119,9 +139,18 @@ export const sendMessage = async (req, res) => {
 export const markMessagesAsRead = async (req, res) => {
   const { senderId, receiverId } = req.body;
   try {
+    const senderVariations = getUserVariations(senderId);
+    const receiverVariations = getUserVariations(receiverId);
+
     await Message.update(
       { status: "read", isRead: true },
-      { where: { senderId, receiverId, isRead: false } }
+      {
+        where: {
+          senderId: { [Op.in]: senderVariations },
+          receiverId: { [Op.in]: receiverVariations },
+          isRead: false,
+        },
+      }
     );
     res.status(200).json({ success: true, message: "Messages marked as read" });
   } catch (error) {
@@ -253,15 +282,18 @@ export const deleteConversation = async (req, res) => {
 export const getConversations = async (req, res) => {
   const { userId } = req.params;
   try {
+    const userVariations = getUserVariations(userId);
+    const safeUserId = String(userId).replace(/[^a-zA-Z0-9_-]/g, "");
+
     const messages = await Message.findAll({
       where: [
         {
           [Op.or]: [
-            { senderId: userId },
-            { receiverId: userId },
+            { senderId: { [Op.in]: userVariations } },
+            { receiverId: { [Op.in]: userVariations } },
           ],
         },
-        sequelize.literal(`JSON_EXTRACT(IFNULL(deletedmsges, '{}'), '$."${userId}"') IS NULL`)
+        sequelize.literal(`JSON_EXTRACT(IFNULL(deletedmsges, '{}'), '$."${safeUserId}"') IS NULL`)
       ],
       order: [["createdAt", "DESC"]],
     });
@@ -269,14 +301,15 @@ export const getConversations = async (req, res) => {
     const conversationMap = new Map();
 
     for (const msg of messages) {
-      const otherId = String(msg.senderId === userId ? msg.receiverId : msg.senderId);
+      const isSender = userVariations.includes(String(msg.senderId));
+      const otherId = String(isSender ? msg.receiverId : msg.senderId);
       if (!conversationMap.has(otherId)) {
         conversationMap.set(otherId, {
           lastMsg: msg,
           unreadCount: 0,
         });
       }
-      if (String(msg.receiverId) === String(userId) && !msg.isRead) {
+      if (userVariations.includes(String(msg.receiverId)) && !msg.isRead) {
         const entry = conversationMap.get(otherId);
         entry.unreadCount += 1;
       }
