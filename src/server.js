@@ -61,6 +61,15 @@ async function connectDB() {
   try {
     await sequelize.authenticate();
     console.log("✅ Database Connected Successfully");
+    try {
+      const [cols] = await sequelize.query("SHOW COLUMNS FROM `messages` LIKE 'sale_order_id'");
+      if (!cols || cols.length === 0) {
+        await sequelize.query("ALTER TABLE `messages` ADD COLUMN `sale_order_id` BIGINT UNSIGNED NULL AFTER `receiverType`, ADD INDEX `idx_messages_sale_order_id` (`sale_order_id`)");
+        console.log("✅ Added sale_order_id column to messages table");
+      }
+    } catch (e) {
+      console.warn("Notice checking messages sale_order_id column:", e.message);
+    }
   } catch (error) {
     console.error("❌ Database Connection Failed:", error);
   }

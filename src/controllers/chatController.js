@@ -1,8 +1,10 @@
 import Message from "../../models/index.js";
+import Ticket from "../../models/Ticket.js";
+import TicketMessage from "../../models/TicketMessage.js";
 import VendorLogin from "../../models/VendorLogin.js";
 import UserLogin from "../../models/UserLogin.js";
 import { Op } from "sequelize";
-import { emitToUser } from "../sockets/socket.js";
+import { emitToUser, emitToOrder, emitToTicket } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import s3ImageUploader from "../services/S3service.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
@@ -20,12 +22,13 @@ export const getUserVariations = (id) => {
 
 export const getChatHistory = async (req, res) => {
   const { userId, otherUserId } = req.params;
-  const { chatType } = req.query;
+  const { chatType, sale_order_id, saleOrderId } = req.query;
+  const orderId = sale_order_id || saleOrderId;
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 10; // default 50 for backward compatibility if not passed
   const offset = (page - 1) * limit;
 
-  console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, page: ${page}, limit: ${limit}, chatType: ${chatType || 'all'}`);
+  console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, order: ${orderId || 'none'}, page: ${page}, limit: ${limit}, chatType: ${chatType || 'all'}`);
 
   try {
     const userVariations = getUserVariations(userId);
@@ -50,6 +53,14 @@ export const getChatHistory = async (req, res) => {
 
     if (chatType && chatType !== 'all') {
       whereConditions.push({ chatType });
+    }
+
+    if (orderId && orderId !== 'all') {
+      if (orderId === 'null' || orderId === 'none') {
+        whereConditions.push({ sale_order_id: null });
+      } else {
+        whereConditions.push({ sale_order_id: orderId });
+      }
     }
 
     const messages = await Message.findAll({
@@ -81,6 +92,49 @@ export const getChatHistory = async (req, res) => {
   }
 };
 
+export const getOrderChatHistory = async (req, res) => {
+  const { saleOrderId } = req.params;
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const offset = (page - 1) * limit;
+
+  console.log(`Fetching chat history for order ${saleOrderId}, page: ${page}, limit: ${limit}`);
+
+  try {
+    const messages = await Message.findAll({
+      where: {
+        sale_order_id: saleOrderId,
+      },
+      order: [["createdAt", "DESC"]],
+      limit: limit,
+      offset: offset,
+    });
+
+    messages.reverse();
+
+    const formattedMessages = messages.map((msg) => {
+      const msgData = msg.toJSON ? msg.toJSON() : { ...msg };
+      if (
+        msgData.messageType === "image" ||
+        msgData.messageType === "file" ||
+        (typeof msgData.message === "string" && msgData.message.startsWith("chatUploads/"))
+      ) {
+        msgData.message = buildFileUrl(msgData.message);
+      }
+      return msgData;
+    });
+
+    res.status(200).json({
+      success: true,
+      sale_order_id: saleOrderId,
+      data: formattedMessages,
+    });
+  } catch (error) {
+    console.error("Error fetching order chat history:", error);
+    res.status(500).json({ error: "Failed to fetch order chat history" });
+  }
+};
+
 export const sendMessage = async (req, res) => {
   try {
     const {
@@ -94,20 +148,25 @@ export const sendMessage = async (req, res) => {
       sender_type,
       receiver_type,
       chat_type,
+      sale_order_id,
+      saleOrderId,
     } = req.body;
 
     if (!senderId || !receiverId || !message) {
       return res.status(400).json({ error: "senderId, receiverId, and message are required" });
     }
 
+    const orderId = sale_order_id || saleOrderId || null;
+
     const savedMessage = await Message.create({
       senderId: String(senderId),
       receiverId: String(receiverId),
       message,
       messageType,
-      chatType: chatType || chat_type || "private",
+      chatType: chatType || chat_type || (orderId ? "order" : "private"),
       senderType: senderType || sender_type || null,
       receiverType: receiverType || receiver_type || null,
+      sale_order_id: orderId,
       isRead: false,
       status: "sent",
     });
@@ -124,6 +183,11 @@ export const sendMessage = async (req, res) => {
 
     // Emit via socket to receiver if connected
     emitToUser(String(receiverId), "receive_message", messageData);
+
+    // If order message, broadcast to the order chat room
+    if (orderId) {
+      emitToOrder(orderId, "receive_message", messageData);
+    }
 
     res.status(201).json({
       success: true,
@@ -414,3 +478,279 @@ export const getConversations = async (req, res) => {
     res.status(500).json({ error: "Failed to fetch conversations" });
   }
 };
+
+export const createTicket = async (req, res) => {
+  try {
+    const {
+      sale_order_id,
+      vendor_id,
+      ticket_type = "order",
+      priority = "medium",
+      message,
+      sender_id,
+      sender_type = "customer",
+      receiver_id,
+      receiver_type = "admin",
+      file_path
+    } = req.body;
+
+    const generatedCode = `TKT-${sale_order_id || Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const ticket = await Ticket.create({
+      sale_order_id: sale_order_id || null,
+      ticket_code: generatedCode,
+      vendor_id: vendor_id || null,
+      ticket_type: ticket_type || "order",
+      priority: priority || "medium",
+      status: "open",
+    });
+
+    let initialMessage = null;
+    if (message || file_path) {
+      const cleanSenderId = parseInt(String(sender_id || "").replace(/[^0-9]/g, ""), 10) || 1;
+      const cleanReceiverId = parseInt(String(receiver_id || "").replace(/[^0-9]/g, ""), 10) || 1;
+
+      initialMessage = await TicketMessage.create({
+        ticket_id: ticket.id,
+        sender_id: cleanSenderId,
+        sender_type: sender_type || "customer",
+        receiver_id: cleanReceiverId,
+        receiver_type: receiver_type || "admin",
+        message: message || null,
+        file_path: file_path || null,
+      });
+
+      const msgData = initialMessage.toJSON();
+      if (msgData.file_path) {
+        msgData.file_path = buildFileUrl(msgData.file_path);
+      }
+      msgData.ticket = ticket.toJSON();
+
+      emitToUser(receiver_id, "receive_ticket_message", msgData);
+      emitToUser(receiver_id, "receive_message", msgData);
+      emitToTicket(ticket.id, "receive_ticket_message", msgData);
+      emitToTicket(ticket.id, "receive_message", msgData);
+
+      if (ticket.sale_order_id) {
+        emitToOrder(ticket.sale_order_id, "receive_ticket_message", msgData);
+        emitToOrder(ticket.sale_order_id, "receive_message", msgData);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Ticket created successfully",
+      ticket,
+      initialMessage,
+    });
+  } catch (error) {
+    console.error("Error creating ticket:", error);
+    res.status(500).json({ error: "Failed to create ticket", details: error.message });
+  }
+};
+
+export const sendTicketMessage = async (req, res) => {
+  try {
+    const {
+      ticket_id,
+      sale_order_id,
+      vendor_id,
+      sender_id,
+      sender_type,
+      receiver_id,
+      receiver_type,
+      message,
+      file_path,
+      ticket_type = "order",
+      priority = "medium",
+    } = req.body;
+
+    if (!sender_id || !receiver_id || (!message && !file_path)) {
+      return res.status(400).json({ error: "sender_id, receiver_id, and message or file_path are required" });
+    }
+
+    let ticket = null;
+    if (ticket_id) {
+      ticket = await Ticket.findByPk(ticket_id);
+    } else if (sale_order_id) {
+      ticket = await Ticket.findOne({ where: { sale_order_id, status: "open" } });
+      if (!ticket) {
+        ticket = await Ticket.create({
+          sale_order_id,
+          ticket_code: `TKT-${sale_order_id}-${Math.floor(1000 + Math.random() * 9000)}`,
+          vendor_id: vendor_id || null,
+          ticket_type: ticket_type || "order",
+          priority: priority || "medium",
+          status: "open",
+        });
+      }
+    }
+
+    const cleanSenderId = parseInt(String(sender_id).replace(/[^0-9]/g, ""), 10) || 1;
+    const cleanReceiverId = parseInt(String(receiver_id).replace(/[^0-9]/g, ""), 10) || 1;
+
+    let sType = sender_type ? String(sender_type).toLowerCase() : "customer";
+    if (String(sender_id).toLowerCase().includes("admin")) sType = "admin";
+    else if (String(sender_id).toLowerCase().includes("vendor")) sType = "vendor";
+    else if (String(sender_id).toLowerCase().includes("customer")) sType = "customer";
+
+    let rType = receiver_type ? String(receiver_type).toLowerCase() : "admin";
+    if (String(receiver_id).toLowerCase().includes("admin")) rType = "admin";
+    else if (String(receiver_id).toLowerCase().includes("vendor")) rType = "vendor";
+    else if (String(receiver_id).toLowerCase().includes("customer")) rType = "customer";
+
+    if (!["customer", "vendor", "admin", "user"].includes(rType)) {
+      rType = "admin";
+    }
+
+    const savedTicketMessage = await TicketMessage.create({
+      ticket_id: ticket ? ticket.id : (ticket_id || null),
+      sender_id: cleanSenderId,
+      sender_type: sType,
+      receiver_id: cleanReceiverId,
+      receiver_type: rType,
+      message: message || null,
+      file_path: file_path || null,
+    });
+
+    const msgData = savedTicketMessage.toJSON();
+    if (msgData.file_path) {
+      msgData.file_path = buildFileUrl(msgData.file_path);
+    }
+    if (ticket) {
+      msgData.ticket = ticket.toJSON();
+      msgData.sale_order_id = ticket.sale_order_id;
+    }
+
+    // Emit real-time events
+    emitToUser(receiver_id, "receive_ticket_message", msgData);
+    emitToUser(receiver_id, "receive_message", msgData);
+
+    if (ticket?.id) {
+      emitToTicket(ticket.id, "receive_ticket_message", msgData);
+      emitToTicket(ticket.id, "receive_message", msgData);
+    }
+
+    if (ticket?.sale_order_id) {
+      emitToOrder(ticket.sale_order_id, "receive_ticket_message", msgData);
+      emitToOrder(ticket.sale_order_id, "receive_message", msgData);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Ticket message saved successfully",
+      data: msgData,
+    });
+  } catch (error) {
+    console.error("Error sending ticket message:", error);
+    res.status(500).json({ error: "Failed to send ticket message", details: error.message });
+  }
+};
+
+export const getTicketMessages = async (req, res) => {
+  const { ticketId } = req.params;
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const offset = (page - 1) * limit;
+
+  try {
+    const ticket = await Ticket.findByPk(ticketId);
+    if (!ticket) {
+      return res.status(404).json({ error: "Ticket not found" });
+    }
+
+    const messages = await TicketMessage.findAll({
+      where: { ticket_id: ticketId },
+      order: [["created_at", "DESC"]],
+      limit: limit,
+      offset: offset,
+    });
+
+    messages.reverse();
+
+    const formatted = messages.map((m) => {
+      const j = m.toJSON();
+      if (j.file_path) j.file_path = buildFileUrl(j.file_path);
+      return j;
+    });
+
+    res.status(200).json({
+      success: true,
+      ticket,
+      messages: formatted,
+    });
+  } catch (error) {
+    console.error("Error fetching ticket messages:", error);
+    res.status(500).json({ error: "Failed to fetch ticket messages" });
+  }
+};
+
+export const getOrderTicketMessages = async (req, res) => {
+  const { saleOrderId } = req.params;
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const offset = (page - 1) * limit;
+
+  try {
+    const ticket = await Ticket.findOne({
+      where: { sale_order_id: saleOrderId },
+      order: [["create_date", "DESC"]],
+    });
+
+    if (!ticket) {
+      return res.status(200).json({
+        success: true,
+        sale_order_id: saleOrderId,
+        ticket: null,
+        messages: [],
+      });
+    }
+
+    const messages = await TicketMessage.findAll({
+      where: { ticket_id: ticket.id },
+      order: [["created_at", "DESC"]],
+      limit: limit,
+      offset: offset,
+    });
+
+    messages.reverse();
+
+    const formatted = messages.map((m) => {
+      const j = m.toJSON();
+      if (j.file_path) j.file_path = buildFileUrl(j.file_path);
+      return j;
+    });
+
+    res.status(200).json({
+      success: true,
+      sale_order_id: saleOrderId,
+      ticket,
+      messages: formatted,
+    });
+  } catch (error) {
+    console.error("Error fetching order ticket messages:", error);
+    res.status(500).json({ error: "Failed to fetch order ticket messages" });
+  }
+};
+
+export const markTicketMessagesSeen = async (req, res) => {
+  const { ticket_id, receiver_id } = req.body;
+  try {
+    const cleanReceiverId = parseInt(String(receiver_id || "").replace(/[^0-9]/g, ""), 10);
+    const whereCondition = { ticket_id, seen_at: null };
+    if (cleanReceiverId) {
+      whereCondition.receiver_id = cleanReceiverId;
+    }
+
+    await TicketMessage.update(
+      { seen_at: new Date() },
+      { where: whereCondition }
+    );
+
+    res.status(200).json({ success: true, message: "Ticket messages marked as seen" });
+  } catch (error) {
+    console.error("Error marking ticket messages seen:", error);
+    res.status(500).json({ error: "Failed to mark ticket messages as seen" });
+  }
+};
+

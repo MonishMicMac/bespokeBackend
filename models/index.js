@@ -52,6 +52,11 @@ const Message = sequelize.define(
       allowNull: true,
       defaultValue: null,
     },
+    sale_order_id: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+      defaultValue: null,
+    },
   },
   {
     tableName: "messages",

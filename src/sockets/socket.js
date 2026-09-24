@@ -1,4 +1,6 @@
 import Message from "../../models/index.js";
+import Ticket from "../../models/Ticket.js";
+import TicketMessage from "../../models/TicketMessage.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
 
 let ioInstance = null;
@@ -66,44 +68,162 @@ export function initSocket(io) {
       socket.emit("online_users", Object.keys(connectedUsers));
     });
 
+    // Join order chat room (for order-specific chat between admin, vendor, customer)
+    socket.on("join_order", (saleOrderId) => {
+      if (!saleOrderId) return;
+      const orderRoom = `order_${saleOrderId}`;
+      socket.join(orderRoom);
+      console.log(`📦 Socket ${socket.id} joined order room: ${orderRoom}`);
+    });
+
+    // Leave order chat room
+    socket.on("leave_order", (saleOrderId) => {
+      if (!saleOrderId) return;
+      const orderRoom = `order_${saleOrderId}`;
+      socket.leave(orderRoom);
+      console.log(`📦 Socket ${socket.id} left order room: ${orderRoom}`);
+    });
+
+    // Join ticket chat room
+    socket.on("join_ticket", (ticketId) => {
+      if (!ticketId) return;
+      const ticketRoom = `ticket_${ticketId}`;
+      socket.join(ticketRoom);
+      console.log(`🎫 Socket ${socket.id} joined ticket room: ${ticketRoom}`);
+    });
+
+    // Leave ticket chat room
+    socket.on("leave_ticket", (ticketId) => {
+      if (!ticketId) return;
+      const ticketRoom = `ticket_${ticketId}`;
+      socket.leave(ticketRoom);
+      console.log(`🎫 Socket ${socket.id} left ticket room: ${ticketRoom}`);
+    });
+
+    // Handle Sending Ticket Messages directly to ticket_messages table
+    socket.on("send_ticket_message", async (data) => {
+      console.log("Received send_ticket_message payload:", data);
+      const ticketRes = await saveTicketMessageHelper({
+        ticketId: data.ticket_id || data.ticketId,
+        saleOrderId: data.sale_order_id || data.saleOrderId,
+        vendorId: data.vendor_id || data.vendorId,
+        senderId: data.sender_id || data.senderId,
+        senderType: data.sender_type || data.senderType,
+        receiverId: data.receiver_id || data.receiverId,
+        receiverType: data.receiver_type || data.receiverType,
+        message: data.message,
+        filePath: data.file_path || data.filePath,
+        ticketType: data.ticket_type || data.ticketType || "order",
+        priority: data.priority || "n/a",
+      });
+
+      if (ticketRes && ticketRes.ticketMessage) {
+        const msgJson = ticketRes.ticketMessage.toJSON();
+        if (msgJson.file_path) {
+          msgJson.file_path = buildFileUrl(msgJson.file_path);
+        }
+        if (ticketRes.ticket) {
+          msgJson.ticket = ticketRes.ticket.toJSON();
+          msgJson.sale_order_id = ticketRes.ticket.sale_order_id;
+        }
+
+        // Emit to receiver directly
+        emitToUser(data.receiver_id || data.receiverId, "receive_ticket_message", msgJson);
+        emitToUser(data.receiver_id || data.receiverId, "receive_message", msgJson);
+
+        // Emit to ticket room
+        if (ticketRes.ticket?.id) {
+          emitToTicket(ticketRes.ticket.id, "receive_ticket_message", msgJson);
+          emitToTicket(ticketRes.ticket.id, "receive_message", msgJson);
+        }
+
+        // Emit to order room
+        if (ticketRes.ticket?.sale_order_id) {
+          emitToOrder(ticketRes.ticket.sale_order_id, "receive_ticket_message", msgJson);
+          emitToOrder(ticketRes.ticket.sale_order_id, "receive_message", msgJson);
+        }
+
+        socket.emit("ticket_message_status", {
+          status: "sent",
+          messageId: ticketRes.ticketMessage.id,
+          ticketId: ticketRes.ticket?.id,
+          sale_order_id: ticketRes.ticket?.sale_order_id
+        });
+      }
+    });
+
     // Handle Sending Messages
     socket.on("send_message", async (data) => {
       console.log("Received send_message payload:", data);
-      
+
       const receiverSocketId = connectedUsers[data.receiverId];
       let initialStatus = "sent";
       if (receiverSocketId) {
-          initialStatus = "delivered";
+        initialStatus = "delivered";
       }
 
+      const saleOrderId = data.sale_order_id || data.saleOrderId || null;
+      const ticketId = data.ticket_id || data.ticketId || null;
+
+      // 1. Store in general messages table
       const savedMessage = await Message.create({
-          senderId: data.senderId,
-          receiverId: data.receiverId,
-          message: data.message,
-          chatType: data.chatType || data.chat_type || "private",
-          senderType: data.senderType || data.sender_type || null,
-          receiverType: data.receiverType || data.receiver_type || null,
-          messageType: data.messageType || "text",
-          isRead: false,
-          status: initialStatus,
+        senderId: data.senderId,
+        receiverId: data.receiverId,
+        message: data.message,
+        chatType: data.chatType || data.chat_type || (saleOrderId ? "order" : "private"),
+        senderType: data.senderType || data.sender_type || null,
+        receiverType: data.receiverType || data.receiver_type || null,
+        messageType: data.messageType || "text",
+        sale_order_id: saleOrderId,
+        isRead: false,
+        status: initialStatus,
       });
       const messageData = savedMessage.toJSON();
       if (messageData.messageType === "image") {
         messageData.message = buildFileUrl(messageData.message);
       }
+
+      // 2. Also persist into ticket_messages table if ticket_id or sale_order_id is provided
+      if (ticketId || saleOrderId) {
+        const ticketRes = await saveTicketMessageHelper({
+          ticketId,
+          saleOrderId,
+          vendorId: data.vendor_id || data.vendorId,
+          senderId: data.senderId,
+          senderType: data.senderType || data.sender_type,
+          receiverId: data.receiverId,
+          receiverType: data.receiverType || data.receiver_type,
+          message: data.message,
+          filePath: data.messageType === "image" ? data.message : null,
+        });
+        if (ticketRes?.ticket) {
+          messageData.ticket_id = ticketRes.ticket.id;
+          messageData.ticket_code = ticketRes.ticket.ticket_code;
+        }
+      }
+
       console.log("Emitting message data:", messageData);
 
       // Emit to receiver using room and socket routing (supports customer, vendor, admin)
       emitToUser(data.receiverId, "receive_message", messageData);
- 
 
+      // If message belongs to an order, broadcast to the order chat room
+      if (saleOrderId) {
+        emitToOrder(saleOrderId, "receive_message", messageData);
+      }
 
+      // If message belongs to a ticket, broadcast to the ticket room
+      if (messageData.ticket_id || ticketId) {
+        emitToTicket(messageData.ticket_id || ticketId, "receive_message", messageData);
+      }
 
       // Notify sender of the delivery status
       socket.emit("message_status", {
-          messageId: savedMessage.id,
-          status: initialStatus,
-          receiverId: data.receiverId
+        messageId: savedMessage.id,
+        status: initialStatus,
+        receiverId: data.receiverId,
+        sale_order_id: saleOrderId,
+        ticket_id: messageData.ticket_id || ticketId || null
       });
     });
 
@@ -122,7 +242,7 @@ export function initSocket(io) {
         console.error("Error marking messages as read:", err);
       }
     });
-  
+
     // Handle message deletion socket event
     socket.on("delete_message", async ({ messageId, userId }) => {
       try {
@@ -138,12 +258,12 @@ export function initSocket(io) {
             }
           }
           deletedObj[userId] = new Date().toISOString();
-          
+
           await Message.update(
             { deletedmsges: deletedObj },
             { where: { id: messageId } }
           );
-          
+
           const deletingUserSocketId = connectedUsers[userId];
           if (deletingUserSocketId) {
             io.to(deletingUserSocketId).emit("message_deleted", { messageId });
@@ -239,5 +359,96 @@ export function emitToAdmin(event, data) {
     ioInstance.to(directSocketId).emit(event, data);
   }
 }
+
+export function emitToOrder(orderId, event, data) {
+  if (!ioInstance) {
+    console.warn("⚠️ Cannot emit to order room, ioInstance is not initialized");
+    return;
+  }
+  if (!orderId) return;
+
+  const room = `order_${orderId}`;
+  console.log(`📦 Emitting '${event}' to order room: ${room}`);
+  ioInstance.to(room).emit(event, data);
+}
+
+export function emitToTicket(ticketId, event, data) {
+  if (!ioInstance) {
+    console.warn("⚠️ Cannot emit to ticket room, ioInstance is not initialized");
+    return;
+  }
+  if (!ticketId) return;
+
+  const room = `ticket_${ticketId}`;
+  console.log(`🎫 Emitting '${event}' to ticket room: ${room}`);
+  ioInstance.to(room).emit(event, data);
+}
+
+export async function saveTicketMessageHelper({
+  ticketId,
+  saleOrderId,
+  vendorId,
+  senderId,
+  senderType,
+  receiverId,
+  receiverType,
+  message,
+  filePath,
+  ticketType = "order",
+  priority = "n/a",
+}) {
+  try {
+    let ticket = null;
+    if (ticketId) {
+      ticket = await Ticket.findByPk(ticketId);
+    } else if (saleOrderId) {
+      ticket = await Ticket.findOne({ where: { sale_order_id: saleOrderId, status: "open" } });
+      if (!ticket) {
+        ticket = await Ticket.create({
+          sale_order_id: saleOrderId,
+          ticket_code: `TKT-${saleOrderId}-${Math.floor(1000 + Math.random() * 9000)}`,
+          vendor_id: vendorId || null,
+          ticket_type: ticketType || "order",
+          priority: priority || "medium",
+          status: "open",
+        });
+      }
+    }
+
+    const cleanSenderId = parseInt(String(senderId || "").replace(/[^0-9]/g, ""), 10) || 1;
+    const cleanReceiverId = parseInt(String(receiverId || "").replace(/[^0-9]/g, ""), 10) || 1;
+
+    let sType = senderType ? String(senderType).toLowerCase() : "customer";
+    if (String(senderId).toLowerCase().includes("admin")) sType = "admin";
+    else if (String(senderId).toLowerCase().includes("vendor")) sType = "vendor";
+    else if (String(senderId).toLowerCase().includes("customer")) sType = "customer";
+
+    let rType = receiverType ? String(receiverType).toLowerCase() : "admin";
+    if (String(receiverId).toLowerCase().includes("admin")) rType = "admin";
+    else if (String(receiverId).toLowerCase().includes("vendor")) rType = "vendor";
+    else if (String(receiverId).toLowerCase().includes("customer")) rType = "customer";
+
+    // Valid receiver_type enum: 'customer','vendor','admin','user'
+    if (!["customer", "vendor", "admin", "user"].includes(rType)) {
+      rType = "admin";
+    }
+
+    const savedTicketMessage = await TicketMessage.create({
+      ticket_id: ticket ? ticket.id : (ticketId || null),
+      sender_id: cleanSenderId,
+      sender_type: sType,
+      receiver_id: cleanReceiverId,
+      receiver_type: rType,
+      message: message || null,
+      file_path: filePath || null,
+    });
+
+    return { ticket, ticketMessage: savedTicketMessage };
+  } catch (err) {
+    console.error("Error saving ticket message in helper:", err);
+    return null;
+  }
+}
+
 
 
