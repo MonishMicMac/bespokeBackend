@@ -2,6 +2,7 @@ import express from "express";
 import {
   getChatHistory,
   getOrderChatHistory,
+  getOrderRoomChatHistory,
   getConversations,
   sendMessage,
   markMessagesAsRead,
@@ -17,6 +18,11 @@ import {
 import upload from "../middleware/upload.js";
 
 const router = express.Router();
+
+// --- Isolated Order Room Chat Endpoints ---
+// GET /api/chat/order-room/:roomId (or /order-room?sale_order_id=...&target_type=vendor&target_id=...)
+router.get("/order-room/:roomId", getOrderRoomChatHistory);
+router.get("/order-room", getOrderRoomChatHistory);
 
 // --- Ticket Chat Endpoints (using `tickets` and `ticket_messages` tables) ---
 // POST /api/chat/ticket (Create a new ticket for sale_order_id with optional first message)

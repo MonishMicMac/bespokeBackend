@@ -57,6 +57,11 @@ const Message = sequelize.define(
       allowNull: true,
       defaultValue: null,
     },
+    room_id: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      defaultValue: null,
+    },
   },
   {
     tableName: "messages",

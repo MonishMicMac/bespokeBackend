@@ -4,7 +4,7 @@ import TicketMessage from "../../models/TicketMessage.js";
 import VendorLogin from "../../models/VendorLogin.js";
 import UserLogin from "../../models/UserLogin.js";
 import { Op } from "sequelize";
-import { emitToUser, emitToOrder, emitToTicket } from "../sockets/socket.js";
+import { emitToUser, emitToOrder, emitToTicket, emitToRoom, buildOrderRoomId, saveTicketMessageHelper } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import s3ImageUploader from "../services/S3service.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
@@ -22,13 +22,14 @@ export const getUserVariations = (id) => {
 
 export const getChatHistory = async (req, res) => {
   const { userId, otherUserId } = req.params;
-  const { chatType, sale_order_id, saleOrderId } = req.query;
+  const { chatType, sale_order_id, saleOrderId, roomId, room_id, include_order_rooms } = req.query;
   const orderId = sale_order_id || saleOrderId;
+  const explicitRoom = roomId || room_id;
   const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 10; // default 50 for backward compatibility if not passed
+  const limit = parseInt(req.query.limit, 10) || 10;
   const offset = (page - 1) * limit;
 
-  console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, order: ${orderId || 'none'}, page: ${page}, limit: ${limit}, chatType: ${chatType || 'all'}`);
+  console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, order: ${orderId || 'none'}, room: ${explicitRoom || 'direct'}, page: ${page}`);
 
   try {
     const userVariations = getUserVariations(userId);
@@ -55,12 +56,22 @@ export const getChatHistory = async (req, res) => {
       whereConditions.push({ chatType });
     }
 
-    if (orderId && orderId !== 'all') {
+    if (explicitRoom) {
+      whereConditions.push({ room_id: explicitRoom });
+    } else if (orderId && orderId !== 'all') {
       if (orderId === 'null' || orderId === 'none') {
         whereConditions.push({ sale_order_id: null });
       } else {
         whereConditions.push({ sale_order_id: orderId });
       }
+    } else if (include_order_rooms !== 'true') {
+      // Normal direct chat: strictly exclude order chat rooms!
+      whereConditions.push({
+        [Op.or]: [
+          { room_id: null },
+          { room_id: "" }
+        ]
+      });
     }
 
     const messages = await Message.findAll({
@@ -89,6 +100,105 @@ export const getChatHistory = async (req, res) => {
   } catch (error) {
     console.error("Error fetching chat history:", error);
     res.status(500).json({ error: "Failed to fetch chat history" });
+  }
+};
+
+export const getOrderRoomChatHistory = async (req, res) => {
+  let roomId = req.params.roomId || req.query.roomId || req.query.room_id;
+  const { sale_order_id, target_type, target_id, targetType, targetId } = req.query;
+
+  const tType = target_type || targetType;
+  const tId = target_id || targetId;
+
+  if (!roomId && sale_order_id && tType && tId) {
+    roomId = buildOrderRoomId({
+      saleOrderId: sale_order_id,
+      targetType: tType,
+      targetId: tId
+    });
+  }
+
+  // Parse order ID and target from roomId if not passed explicitly
+  let extractedOrderId = sale_order_id;
+  let isVendor = tType ? tType.toLowerCase().includes("vendor") : false;
+  if (roomId) {
+    const match = roomId.match(/order_chat_(\d+)_(vendor|customer)_to_admin_(\d+)/i);
+    if (match) {
+      extractedOrderId = match[1];
+      isVendor = match[2].toLowerCase() === "vendor";
+    } else {
+      isVendor = roomId.toLowerCase().includes("vendor");
+    }
+  }
+
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 100;
+  const offset = (page - 1) * limit;
+
+  console.log(`Fetching isolated order room chat history from ticket_messages for: ${roomId || 'N/A'}, order: ${extractedOrderId}, isVendor: ${isVendor}`);
+
+  try {
+    let whereCondition = {};
+    if (extractedOrderId) {
+      const tickets = await Ticket.findAll({
+        where: {
+          sale_order_id: extractedOrderId,
+        }
+      });
+      const ticketIds = tickets.map((t) => t.id);
+
+      whereCondition.ticket_id = { [Op.in]: ticketIds.length > 0 ? ticketIds : [-1] };
+      if (isVendor) {
+        whereCondition[Op.or] = [{ sender_type: "vendor" }, { receiver_type: "vendor" }];
+      } else {
+        whereCondition[Op.or] = [{ sender_type: "customer" }, { receiver_type: "customer" }];
+      }
+    }
+
+    const messages = await TicketMessage.findAll({
+      where: whereCondition,
+      order: [["created_at", "DESC"]],
+      limit,
+      offset
+    });
+
+    messages.reverse();
+
+    const formattedMessages = messages.map((m) => {
+      const j = m.toJSON();
+      const sId = j.sender_type === "admin" ? "admin" : `${j.sender_type}_${j.sender_id}`;
+      const rId = j.receiver_type === "admin" ? "admin" : `${j.receiver_type}_${j.receiver_id}`;
+      return {
+        id: j.id,
+        ticket_id: j.ticket_id,
+        roomId: roomId || `order_chat_${extractedOrderId}_${isVendor ? 'vendor' : 'customer'}_to_admin_${j.receiver_id}`,
+        room_id: roomId || `order_chat_${extractedOrderId}_${isVendor ? 'vendor' : 'customer'}_to_admin_${j.receiver_id}`,
+        sender_id: j.sender_id,
+        senderId: sId,
+        sender_type: j.sender_type,
+        senderType: j.sender_type,
+        receiver_id: j.receiver_id,
+        receiverId: rId,
+        receiver_type: j.receiver_type,
+        receiverType: j.receiver_type,
+        message: j.message || "",
+        text: j.message || "",
+        file_path: j.file_path ? buildFileUrl(j.file_path) : null,
+        messageType: j.file_path ? "image" : "text",
+        created_at: j.created_at,
+        timestamp: j.created_at
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      roomId,
+      sale_order_id: extractedOrderId,
+      messages: formattedMessages
+    });
+  } catch (error) {
+    console.error("Error fetching order room chat history from ticket_messages:", error);
+    res.status(500).json({ error: "Failed to fetch order room chat history" });
   }
 };
 
@@ -150,28 +260,118 @@ export const sendMessage = async (req, res) => {
       chat_type,
       sale_order_id,
       saleOrderId,
+      order_id,
+      orderId: bodyOrderId,
+      roomId,
+      room_id,
+      room,
+      ticket_id,
+      ticketId,
+      target_type,
+      targetType,
+      target_id,
+      targetId,
     } = req.body;
 
     if (!senderId || !receiverId || !message) {
       return res.status(400).json({ error: "senderId, receiverId, and message are required" });
     }
 
-    const orderId = sale_order_id || saleOrderId || null;
+    const orderId = sale_order_id || saleOrderId || order_id || bodyOrderId || null;
+    let targetRoomId = roomId || room_id || room || null;
 
+    const tType = target_type || targetType;
+    const tId = target_id || targetId;
+
+    if (!targetRoomId && orderId && tType && tId) {
+      targetRoomId = buildOrderRoomId({
+        saleOrderId: orderId,
+        targetType: tType,
+        targetId: tId
+      });
+    }
+
+    const isOrderChat = Boolean(
+      targetRoomId ||
+      orderId ||
+      ticket_id ||
+      ticketId ||
+      chatType === "order" ||
+      chat_type === "order" ||
+      (targetRoomId && String(targetRoomId).startsWith("order_"))
+    );
+
+    // --- A. IF ORDER CHAT: SAVE ONLY IN ticket_messages TABLE ---
+    if (isOrderChat) {
+      console.log(`🎫 Routing order message strictly to ticket_messages table (Room: ${targetRoomId || 'N/A'}, Order: ${orderId || 'N/A'})`);
+      const ticketRes = await saveTicketMessageHelper({
+        ticketId: ticket_id || ticketId,
+        saleOrderId: orderId,
+        senderId,
+        senderType: senderType || sender_type,
+        receiverId,
+        receiverType: receiverType || receiver_type,
+        message,
+        filePath: (messageType === "image" || messageType === "file") ? message : null,
+        targetType: tType || (targetRoomId?.includes("vendor") ? "vendor" : "customer"),
+      });
+
+      const orderMsgData = ticketRes?.ticketMessage ? ticketRes.ticketMessage.toJSON() : { ...req.body };
+      orderMsgData.roomId = targetRoomId;
+      orderMsgData.room_id = targetRoomId;
+      orderMsgData.sale_order_id = orderId;
+      orderMsgData.text = orderMsgData.message;
+      if (ticketRes?.ticket) {
+        orderMsgData.ticket_id = ticketRes.ticket.id;
+        orderMsgData.ticket_code = ticketRes.ticket.ticket_code;
+      }
+      if (orderMsgData.file_path) {
+        orderMsgData.file_path = buildFileUrl(orderMsgData.file_path);
+        orderMsgData.message = orderMsgData.file_path;
+      }
+
+      if (targetRoomId) {
+        emitToRoom(targetRoomId, "receive_order_message", orderMsgData);
+      }
+
+      emitToUser(String(receiverId), "order_chat_notification", {
+        roomId: targetRoomId,
+        sale_order_id: orderId,
+        senderId: String(senderId),
+        message: orderMsgData
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: "Order chat message stored successfully in ticket_messages",
+        data: orderMsgData,
+      });
+    }
+
+    // STRICT SAFETY: Do NOT store any order message in messages table
+    if (orderId || (targetRoomId && String(targetRoomId).startsWith("order_")) || ticket_id || ticketId) {
+      console.warn("⚠️ Blocked order message from reaching messages table!");
+      return res.status(400).json({ error: "Order messages must not be stored in messages table" });
+    }
+
+    // --- B. NORMAL 1-ON-1 DIRECT CHAT: SAVE ONLY IN messages TABLE ---
     const savedMessage = await Message.create({
       senderId: String(senderId),
       receiverId: String(receiverId),
       message,
       messageType,
-      chatType: chatType || chat_type || (orderId ? "order" : "private"),
+      chatType: chatType || chat_type || "private",
       senderType: senderType || sender_type || null,
       receiverType: receiverType || receiver_type || null,
-      sale_order_id: orderId,
+      sale_order_id: null,
+      room_id: null,
       isRead: false,
       status: "sent",
     });
 
     const messageData = savedMessage.toJSON();
+    messageData.roomId = targetRoomId;
+    messageData.room_id = targetRoomId;
 
     if (
       messageData.messageType === "image" ||
@@ -181,12 +381,20 @@ export const sendMessage = async (req, res) => {
       messageData.message = buildFileUrl(messageData.message);
     }
 
-    // Emit via socket to receiver if connected
-    emitToUser(String(receiverId), "receive_message", messageData);
+    if (targetRoomId) {
+      // Broadcast exclusively to the isolated order chat room
+      emitToRoom(targetRoomId, "receive_order_message", messageData);
 
-    // If order message, broadcast to the order chat room
-    if (orderId) {
-      emitToOrder(orderId, "receive_message", messageData);
+      // Notification to receiver without cluttering normal 1-on-1 private chat
+      emitToUser(String(receiverId), "order_chat_notification", {
+        roomId: targetRoomId,
+        sale_order_id: orderId,
+        senderId: String(senderId),
+        message: messageData
+      });
+    } else {
+      // Normal direct chat
+      emitToUser(String(receiverId), "receive_message", messageData);
     }
 
     res.status(201).json({
@@ -356,6 +564,12 @@ export const getConversations = async (req, res) => {
             { senderId: { [Op.in]: userVariations } },
             { receiverId: { [Op.in]: userVariations } },
           ],
+        },
+        {
+          [Op.or]: [
+            { room_id: null },
+            { room_id: "" }
+          ]
         },
         sequelize.literal(`JSON_EXTRACT(IFNULL(deletedmsges, '{}'), '$."${safeUserId}"') IS NULL`)
       ],

@@ -68,6 +68,19 @@ export function initSocket(io) {
       socket.emit("online_users", Object.keys(connectedUsers));
     });
 
+    // Generic Room Join / Leave (supports order_chat_${saleOrderId}_... rooms)
+    socket.on("join_room", (roomId) => {
+      if (!roomId) return;
+      socket.join(roomId);
+      console.log(`🚪 Socket ${socket.id} joined room: ${roomId}`);
+    });
+
+    socket.on("leave_room", (roomId) => {
+      if (!roomId) return;
+      socket.leave(roomId);
+      console.log(`🚪 Socket ${socket.id} left room: ${roomId}`);
+    });
+
     // Join order chat room (for order-specific chat between admin, vendor, customer)
     socket.on("join_order", (saleOrderId) => {
       if (!saleOrderId) return;
@@ -129,18 +142,15 @@ export function initSocket(io) {
 
         // Emit to receiver directly
         emitToUser(data.receiver_id || data.receiverId, "receive_ticket_message", msgJson);
-        emitToUser(data.receiver_id || data.receiverId, "receive_message", msgJson);
 
         // Emit to ticket room
         if (ticketRes.ticket?.id) {
           emitToTicket(ticketRes.ticket.id, "receive_ticket_message", msgJson);
-          emitToTicket(ticketRes.ticket.id, "receive_message", msgJson);
         }
 
         // Emit to order room
         if (ticketRes.ticket?.sale_order_id) {
           emitToOrder(ticketRes.ticket.sale_order_id, "receive_ticket_message", msgJson);
-          emitToOrder(ticketRes.ticket.sale_order_id, "receive_message", msgJson);
         }
 
         socket.emit("ticket_message_status", {
@@ -162,19 +172,100 @@ export function initSocket(io) {
         initialStatus = "delivered";
       }
 
-      const saleOrderId = data.sale_order_id || data.saleOrderId || null;
+      const saleOrderId = data.sale_order_id || data.saleOrderId || data.order_id || data.orderId || null;
       const ticketId = data.ticket_id || data.ticketId || null;
 
-      // 1. Store in general messages table
+      // Check if message belongs to an isolated order chat room
+      let explicitRoomId = data.roomId || data.room_id || data.room || null;
+      if (!explicitRoomId && saleOrderId && (data.target_type || data.targetType) && (data.target_id || data.targetId)) {
+        explicitRoomId = buildOrderRoomId({
+          saleOrderId,
+          targetType: data.target_type || data.targetType,
+          targetId: data.target_id || data.targetId
+        });
+      }
+
+      const isOrderChat = Boolean(
+        explicitRoomId ||
+        saleOrderId ||
+        ticketId ||
+        data.chatType === "order" ||
+        data.chat_type === "order" ||
+        (explicitRoomId && String(explicitRoomId).startsWith("order_"))
+      );
+
+      // --- A. IF ORDER / TICKET CHAT: SAVE ONLY IN ticket_messages TABLE ---
+      if (isOrderChat) {
+        console.log(`🎫 Routing order message strictly to ticket_messages table (Room: ${explicitRoomId || 'N/A'}, Order: ${saleOrderId || 'N/A'})`);
+        const ticketRes = await saveTicketMessageHelper({
+          ticketId,
+          saleOrderId,
+          vendorId: data.vendor_id || data.vendorId,
+          senderId: data.senderId || data.sender_id,
+          senderType: data.senderType || data.sender_type,
+          receiverId: data.receiverId || data.receiver_id,
+          receiverType: data.receiverType || data.receiver_type,
+          message: data.message,
+          filePath: data.messageType === "image" ? data.message : (data.file_path || null),
+          targetType: data.target_type || data.targetType || (explicitRoomId?.includes("vendor") ? "vendor" : "customer"),
+        });
+
+        const orderMsgData = ticketRes?.ticketMessage ? ticketRes.ticketMessage.toJSON() : { ...data };
+        orderMsgData.roomId = explicitRoomId;
+        orderMsgData.room_id = explicitRoomId;
+        orderMsgData.sale_order_id = saleOrderId;
+        orderMsgData.text = orderMsgData.message;
+        if (ticketRes?.ticket) {
+          orderMsgData.ticket_id = ticketRes.ticket.id;
+          orderMsgData.ticket_code = ticketRes.ticket.ticket_code;
+        }
+        if (orderMsgData.file_path) {
+          orderMsgData.file_path = buildFileUrl(orderMsgData.file_path);
+          orderMsgData.message = orderMsgData.file_path;
+        }
+
+        // Broadcast exclusively to the order room
+        if (explicitRoomId) {
+          console.log(`📢 Broadcasting message exclusively to order room: ${explicitRoomId}`);
+          io.to(explicitRoomId).emit("receive_order_message", orderMsgData);
+        }
+
+        // Notification to receiver without injecting into normal direct chat
+        emitToUser(data.receiverId, "order_chat_notification", {
+          roomId: explicitRoomId,
+          sale_order_id: saleOrderId,
+          senderId: data.senderId,
+          message: orderMsgData
+        });
+
+        socket.emit("message_status", {
+          messageId: orderMsgData.id,
+          status: "sent",
+          receiverId: data.receiverId,
+          sale_order_id: saleOrderId,
+          roomId: explicitRoomId,
+          ticket_id: orderMsgData.ticket_id || null
+        });
+        return; // NEVER continue to Message.create!
+      }
+
+      // STRICT SAFETY: Do NOT store any order message in messages table
+      if (data.sale_order_id || data.saleOrderId || data.order_id || data.orderId || data.ticket_id || data.ticketId || (explicitRoomId && String(explicitRoomId).startsWith("order_"))) {
+        console.warn("⚠️ Blocked order message from reaching messages table!");
+        return;
+      }
+
+      // --- B. NORMAL 1-ON-1 CHAT: SAVE ONLY IN messages TABLE ---
       const savedMessage = await Message.create({
         senderId: data.senderId,
         receiverId: data.receiverId,
         message: data.message,
-        chatType: data.chatType || data.chat_type || (saleOrderId ? "order" : "private"),
+        chatType: data.chatType || data.chat_type || "private",
         senderType: data.senderType || data.sender_type || null,
         receiverType: data.receiverType || data.receiver_type || null,
         messageType: data.messageType || "text",
-        sale_order_id: saleOrderId,
+        sale_order_id: null,
+        room_id: null,
         isRead: false,
         status: initialStatus,
       });
@@ -183,47 +274,14 @@ export function initSocket(io) {
         messageData.message = buildFileUrl(messageData.message);
       }
 
-      // 2. Also persist into ticket_messages table if ticket_id or sale_order_id is provided
-      if (ticketId || saleOrderId) {
-        const ticketRes = await saveTicketMessageHelper({
-          ticketId,
-          saleOrderId,
-          vendorId: data.vendor_id || data.vendorId,
-          senderId: data.senderId,
-          senderType: data.senderType || data.sender_type,
-          receiverId: data.receiverId,
-          receiverType: data.receiverType || data.receiver_type,
-          message: data.message,
-          filePath: data.messageType === "image" ? data.message : null,
-        });
-        if (ticketRes?.ticket) {
-          messageData.ticket_id = ticketRes.ticket.id;
-          messageData.ticket_code = ticketRes.ticket.ticket_code;
-        }
-      }
-
-      console.log("Emitting message data:", messageData);
-
-      // Emit to receiver using room and socket routing (supports customer, vendor, admin)
+      console.log("Emitting normal message data:", messageData);
       emitToUser(data.receiverId, "receive_message", messageData);
-
-      // If message belongs to an order, broadcast to the order chat room
-      if (saleOrderId) {
-        emitToOrder(saleOrderId, "receive_message", messageData);
-      }
-
-      // If message belongs to a ticket, broadcast to the ticket room
-      if (messageData.ticket_id || ticketId) {
-        emitToTicket(messageData.ticket_id || ticketId, "receive_message", messageData);
-      }
 
       // Notify sender of the delivery status
       socket.emit("message_status", {
         messageId: savedMessage.id,
         status: initialStatus,
-        receiverId: data.receiverId,
-        sale_order_id: saleOrderId,
-        ticket_id: messageData.ticket_id || ticketId || null
+        receiverId: data.receiverId
       });
     });
 
@@ -448,6 +506,30 @@ export async function saveTicketMessageHelper({
     console.error("Error saving ticket message in helper:", err);
     return null;
   }
+}
+
+export function buildOrderRoomId({ saleOrderId, targetType, targetId }) {
+  const cleanOrderId = String(saleOrderId || "").trim();
+  const cleanTargetId = String(targetId || "").replace(/^(customer_|vendor_|admin_)/, "").trim();
+  const cleanType = String(targetType || "").toLowerCase().trim();
+
+  if (cleanType.includes("customer")) {
+    return `order_chat_${cleanOrderId}_customer_to_admin_${cleanTargetId}`;
+  } else if (cleanType.includes("vendor")) {
+    return `order_chat_${cleanOrderId}_vendor_to_admin_${cleanTargetId}`;
+  }
+  return `order_chat_${cleanOrderId}_${cleanType}_${cleanTargetId}`;
+}
+
+export function emitToRoom(roomId, event, data) {
+  if (!ioInstance) {
+    console.warn("⚠️ Cannot emit to room, ioInstance is not initialized");
+    return;
+  }
+  if (!roomId) return;
+
+  console.log(`📢 Emitting '${event}' to room: ${roomId}`);
+  ioInstance.to(roomId).emit(event, data);
 }
 
 
