@@ -78,6 +78,18 @@ const UserLogin = sequelize.define(
       type: DataTypes.STRING(200),
       allowNull: true,
     },
+    dob: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    gender: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+    },
+    prefered_language: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: true,

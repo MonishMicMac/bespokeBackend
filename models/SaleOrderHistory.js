@@ -5,7 +5,7 @@ const SaleOrderHistory = sequelize.define(
   "SaleOrderHistory",
   {
     id: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.BIGINT.UNSIGNED,
       primaryKey: true,
       autoIncrement: true,
     },
@@ -16,7 +16,12 @@ const SaleOrderHistory = sequelize.define(
     },
 
     order_history: {
-      type: DataTypes.ENUM('Pending','Approved','Ready_to_Ship','Dispatched','Decline_Order','material_procurement','Design_Approved','Production_Started'),
+      type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+
+    order_status: {
+      type: DataTypes.STRING(255),
       allowNull: true,
     },
 

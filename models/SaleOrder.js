@@ -53,6 +53,11 @@ const SaleOrder = sequelize.define(
       type: DataTypes.STRING(200),
       allowNull: false,
     },
+    delivery_amount: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: true,
+      defaultValue: 0.0,
+    },
     price_id: {
       type: DataTypes.INTEGER,
       allowNull: true,
@@ -70,18 +75,18 @@ const SaleOrder = sequelize.define(
       allowNull: false,
     },
     is_customisable: {
-      type: DataTypes.ENUM('0', '1'),
+      type: DataTypes.ENUM("0", "1"),
       allowNull: false,
-      defaultValue: '0',
+      defaultValue: "0",
     },
     order_customisable_id: {
       type: DataTypes.INTEGER,
       allowNull: true,
     },
     is_alter: {
-      type: DataTypes.ENUM('0', '1'),
+      type: DataTypes.ENUM("0", "1"),
       allowNull: false,
-      defaultValue: '0',
+      defaultValue: "0",
     },
     alter_amount: {
       type: DataTypes.INTEGER,
@@ -92,12 +97,16 @@ const SaleOrder = sequelize.define(
       allowNull: true,
     },
     action: {
-      type: DataTypes.ENUM('0', '1', '2'),
+      type: DataTypes.ENUM("0", "1", "2"),
       allowNull: false,
-      defaultValue: '0',
+      defaultValue: "0",
     },
     order_history: {
-      type: DataTypes.ENUM('Pending','Approved','Ready_to_Ship','Dispatched','Decline_Order','material_procurement','Design_Approved','Production_Started'),
+      type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+    order_status: {
+      type: DataTypes.STRING(255),
       allowNull: true,
     },
     tracking_number: {
@@ -128,6 +137,14 @@ const SaleOrder = sequelize.define(
       type: DataTypes.DATE,
       allowNull: true,
     },
+    cancelled_by: {
+      type: DataTypes.ENUM("admin", "vendor", "customer"),
+      allowNull: true,
+    },
+    cancelled_type: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
+    },
     pickup_tracking_number: {
       type: DataTypes.STRING(255),
       allowNull: true,
@@ -138,6 +155,10 @@ const SaleOrder = sequelize.define(
     },
     pickup_estimated_delivery: {
       type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+    pickup_address: {
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: true,
     },
     drop_tracking_number: {

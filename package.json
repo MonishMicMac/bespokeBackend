@@ -6,7 +6,19 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node tests/customerModule.test.js && node tests/homepageDiscovery.test.js && node tests/productCatalog.test.js && node tests/vendorDesigner.test.js && node tests/shoppingCart.test.js && node tests/userFavorites.test.js && node tests/deliveryAddresses.test.js && node tests/bespokeMeasurements.test.js && node tests/couponsDiscounts.test.js && node tests/checkoutOrders.test.js && node tests/customerReviews.test.js",
+    "test:customer": "node tests/customerModule.test.js",
+    "test:homepage": "node tests/homepageDiscovery.test.js",
+    "test:catalog": "node tests/productCatalog.test.js",
+    "test:boutique": "node tests/vendorDesigner.test.js",
+    "test:cart": "node tests/shoppingCart.test.js",
+    "test:wishlist": "node tests/userFavorites.test.js",
+    "test:address": "node tests/deliveryAddresses.test.js",
+    "test:measurement": "node tests/bespokeMeasurements.test.js",
+    "test:coupon": "node tests/couponsDiscounts.test.js",
+    "test:order": "node tests/checkoutOrders.test.js",
+    "test:review": "node tests/customerReviews.test.js",
+    "test:all": "node tests/customerModule.test.js && node tests/homepageDiscovery.test.js && node tests/productCatalog.test.js && node tests/vendorDesigner.test.js && node tests/shoppingCart.test.js && node tests/userFavorites.test.js && node tests/deliveryAddresses.test.js && node tests/bespokeMeasurements.test.js && node tests/couponsDiscounts.test.js && node tests/checkoutOrders.test.js && node tests/customerReviews.test.js"
   },
   "keywords": [],
   "author": "",
@@ -15,9 +27,11 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",
     "@aws-sdk/s3-request-presigner": "^3.1079.0",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "firebase-admin": "^14.4.0",
+    "meilisearch": "^0.62.0",
     "multer": "^2.2.0",
     "mysql2": "^3.22.5",
     "nodemailer": "^9.0.3",
