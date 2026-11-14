@@ -5,6 +5,7 @@ import {
   ProductPrice,
   ProductMeasurement,
   Measurement,
+  ProductSize,
   Subcategory,
   SaleOrder,
 } from "../../models/setupAssociations.js";
@@ -242,7 +243,7 @@ export class MeasurementService {
 
   /**
    * Get measurement details of a product by price_id
-   * Faithful reproduction of Laravel MeasurementService::getMeasurementsByPriceId
+   * Faithful reproduction and enrichment of Laravel MeasurementService::getMeasurementsByPriceId
    *
    * @param {number} priceId
    * @returns {Promise<Array>}
@@ -268,10 +269,50 @@ export class MeasurementService {
         ? parseInt(priceRow.product_type, 10)
         : parseInt(product.product_type ?? 0, 10);
 
+    const isCustomizable = productType === 0;
+
+    // Gather available sizes from all active product_prices for this product
+    const allPrices = await ProductPrice.findAll({
+      where: { product_id: product.id },
+      attributes: ["id", "size", "product_type", "is_out_stock"],
+    });
+    const availableSizes = [...new Set(allPrices.map((p) => p.size).filter(Boolean))];
+    const currentSize = priceRow.size || availableSizes[0] || "Standard";
+
+    // Helper to find size value from JSON or string
+    const extractSizeValue = (valSource, targetSize) => {
+      if (!valSource) return null;
+      let parsed = valSource;
+      if (typeof valSource === "string") {
+        try {
+          parsed = JSON.parse(valSource);
+        } catch {
+          if (!isNaN(valSource)) return parseFloat(valSource);
+        }
+      }
+      if (parsed && typeof parsed === "object") {
+        if (parsed.values && typeof parsed.values === "object") {
+          parsed = parsed.values;
+        }
+        for (const [k, v] of Object.entries(parsed)) {
+          if (String(k).trim().toLowerCase() === String(targetSize).trim().toLowerCase()) {
+            return parseFloat(v);
+          }
+        }
+      }
+      return null;
+    };
+
     const orderMeasurementData = [];
 
-    if (productType === 0) {
-      // Customizable product measurements from product_measurements mappings
+    if (isCustomizable) {
+      // 1. Fetch ProductSize details for this product & size if available
+      const pSizes = await ProductSize.findAll({
+        where: { product_id: product.id },
+        include: [{ model: Measurement, as: "measurement" }],
+      });
+
+      // 2. Fetch ProductMeasurement definitions
       const mappings = await ProductMeasurement.findAll({
         where: { product_id: product.id },
         include: [{ model: Measurement, as: "measurement" }],
@@ -280,10 +321,42 @@ export class MeasurementService {
       for (const mapping of mappings) {
         const m = mapping.measurement;
         if (m) {
+          // Standard reference value lookup
+          let standardValue = null;
+          const matchedSizeRow = pSizes.find(
+            (ps) =>
+              Number(ps.measurement_id) === Number(m.id) &&
+              String(ps.size).trim().toLowerCase() === String(currentSize).trim().toLowerCase()
+          );
+          if (matchedSizeRow && matchedSizeRow.details_value) {
+            standardValue = parseFloat(matchedSizeRow.details_value);
+          }
+
+          if (standardValue === null || isNaN(standardValue)) {
+            standardValue = extractSizeValue(mapping.value, currentSize);
+          }
+
+          if (standardValue === null || isNaN(standardValue)) {
+            standardValue = extractSizeValue(m.size_details, currentSize);
+          }
+
+          const numStd = standardValue !== null && !isNaN(standardValue) ? standardValue : 36;
+          const minValue = Math.max(1, Math.round(numStd - 6));
+          const maxValue = Math.round(numStd + 8);
+
           orderMeasurementData.push({
             measurement_id: m.id,
             measurment_name: m.name, // Preserving legacy spelling
+            name: m.name,
             img_path: m.img_path ? buildFileUrl(m.img_path) : null,
+            image: m.img_path ? buildFileUrl(m.img_path) : null,
+            unit: "inches",
+            standard_value: numStd,
+            min_value: minValue,
+            max_value: maxValue,
+            is_customizable: true,
+            current_size: currentSize,
+            available_sizes: availableSizes,
           });
         }
       }
@@ -311,14 +384,31 @@ export class MeasurementService {
         });
 
         for (const m of masterMeasurements) {
+          const standardValue = extractSizeValue(m.size_details, currentSize) ?? 36;
           orderMeasurementData.push({
             measurement_id: m.id,
-            measurment_name: m.name, // Preserving legacy spelling
+            measurment_name: m.name,
+            name: m.name,
             img_path: m.img_path ? buildFileUrl(m.img_path) : null,
+            image: m.img_path ? buildFileUrl(m.img_path) : null,
+            unit: "inches",
+            standard_value: standardValue,
+            min_value: Math.max(1, Math.round(standardValue - 6)),
+            max_value: Math.round(standardValue + 8),
+            is_customizable: false,
+            current_size: currentSize,
+            available_sizes: availableSizes,
           });
         }
       }
     }
+
+    orderMeasurementData.is_customizable = isCustomizable;
+    orderMeasurementData.product_id = product.id;
+    orderMeasurementData.price_id = priceRow.id;
+    orderMeasurementData.current_size = currentSize;
+    orderMeasurementData.available_sizes = availableSizes;
+    orderMeasurementData.measurements = orderMeasurementData;
 
     return orderMeasurementData;
   }

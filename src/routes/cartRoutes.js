@@ -15,6 +15,9 @@ router.put("/update", updateCartQuantity);
 router.post("/update", updateCartQuantity);
 router.delete("/remove", removeFromCart);
 router.post("/remove", removeFromCart);
+router.delete("/remove/:id", removeFromCart);
+router.post("/remove/:id", removeFromCart);
+router.delete("/:id", removeFromCart);
 router.post("/clear", clearCart);
 
 export default router;

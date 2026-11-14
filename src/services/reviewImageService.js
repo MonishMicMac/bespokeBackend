@@ -21,14 +21,23 @@ class ReviewImageService {
       return { isValid: false, format: null, error: "Empty or invalid buffer" };
     }
 
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+    if (buffer.length > MAX_FILE_SIZE) {
+      return {
+        isValid: false,
+        format: null,
+        error: "Image file exceeds the 5MB size limit.",
+      };
+    }
+
     try {
       const metadata = await sharp(buffer).metadata();
-      const allowedFormats = ["jpeg", "jpg", "png", "webp", "gif", "avif", "tiff"];
+      const allowedFormats = ["jpeg", "jpg", "png", "webp"];
       if (!metadata.format || !allowedFormats.includes(metadata.format.toLowerCase())) {
         return {
           isValid: false,
           format: metadata.format || null,
-          error: `Unsupported image format: ${metadata.format || "unknown"}`,
+          error: `Unsupported image format: ${metadata.format || "unknown"}. Only JPG, PNG, and WebP are allowed.`,
         };
       }
       return { isValid: true, format: metadata.format.toLowerCase(), error: null };

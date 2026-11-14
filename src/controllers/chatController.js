@@ -1,13 +1,20 @@
+import "../../models/setupAssociations.js";
 import Message from "../../models/index.js";
 import Ticket from "../../models/Ticket.js";
 import TicketMessage from "../../models/TicketMessage.js";
 import VendorLogin from "../../models/VendorLogin.js";
 import UserLogin from "../../models/UserLogin.js";
+import SaleOrder from "../../models/SaleOrder.js";
+import Product from "../../models/Product.js";
+import Order from "../../models/Order.js";
+import ProductMaterial from "../../models/ProductMaterial.js";
+import ProductMaterialImage from "../../models/ProductMaterialImage.js";
 import { Op } from "sequelize";
-import { emitToUser, emitToOrder, emitToTicket, emitToRoom, buildOrderRoomId, saveTicketMessageHelper } from "../sockets/socket.js";
+import { emitToUser, emitToAdmin, emitToOrder, emitToTicket, emitToRoom, buildOrderRoomId, saveTicketMessageHelper } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import s3ImageUploader from "../services/S3service.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
+
 export const getUserVariations = (id) => {
   if (!id) return [];
   const strId = String(id).trim();
@@ -16,6 +23,12 @@ export const getUserVariations = (id) => {
   if (/^\d+$/.test(cleanId)) {
     variations.add(`customer_${cleanId}`);
     variations.add(`vendor_${cleanId}`);
+    variations.add(`admin_${cleanId}`);
+  }
+  if (cleanId === "1" || strId === "1" || strId.toLowerCase().includes("admin")) {
+    variations.add("admin");
+    variations.add("1");
+    variations.add("admin_1");
   }
   return Array.from(variations);
 };
@@ -26,7 +39,7 @@ export const getChatHistory = async (req, res) => {
   const orderId = sale_order_id || saleOrderId;
   const explicitRoom = roomId || room_id;
   const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 10;
+  const limit = parseInt(req.query.limit, 10) || 100;
   const offset = (page - 1) * limit;
 
   console.log(`Fetching chat history between user ${userId} and user ${otherUserId}, order: ${orderId || 'none'}, room: ${explicitRoom || 'direct'}, page: ${page}`);
@@ -64,8 +77,8 @@ export const getChatHistory = async (req, res) => {
       } else {
         whereConditions.push({ sale_order_id: orderId });
       }
-    } else if (include_order_rooms !== 'true') {
-      // Normal direct chat: strictly exclude order chat rooms!
+    } else {
+      // Normal direct chat: exclude isolated rooms if any, but include all conversation messages
       whereConditions.push({
         [Op.or]: [
           { room_id: null },
@@ -86,14 +99,28 @@ export const getChatHistory = async (req, res) => {
 
     const formattedMessages = messages.map((msg) => {
       const msgData = msg.toJSON ? msg.toJSON() : { ...msg };
+      let fileUrl = null;
       if (
         msgData.messageType === "image" ||
         msgData.messageType === "file" ||
         (typeof msgData.message === "string" && msgData.message.startsWith("chatUploads/"))
       ) {
-        msgData.message = buildFileUrl(msgData.message);
+        fileUrl = buildFileUrl(msgData.message);
+        msgData.message = fileUrl;
       }
-      return msgData;
+      return {
+        ...msgData,
+        id: msgData.id,
+        sender_id: String(msgData.senderId),
+        senderId: String(msgData.senderId),
+        receiver_id: String(msgData.receiverId),
+        receiverId: String(msgData.receiverId),
+        created_at: msgData.createdAt,
+        createdAt: msgData.createdAt,
+        message_type: msgData.messageType || "text",
+        messageType: msgData.messageType || "text",
+        file_path: fileUrl,
+      };
     });
 
     res.status(200).json(formattedMessages);
@@ -205,39 +232,234 @@ export const getOrderRoomChatHistory = async (req, res) => {
 export const getOrderChatHistory = async (req, res) => {
   const { saleOrderId } = req.params;
   const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 50;
+  const limit = parseInt(req.query.limit, 10) || 100;
   const offset = (page - 1) * limit;
 
   console.log(`Fetching chat history for order ${saleOrderId}, page: ${page}, limit: ${limit}`);
 
   try {
-    const messages = await Message.findAll({
-      where: {
-        sale_order_id: saleOrderId,
-      },
-      order: [["createdAt", "DESC"]],
-      limit: limit,
-      offset: offset,
-    });
+    const cleanId = String(saleOrderId || "").trim();
 
-    messages.reverse();
+    // 1. Fetch SaleOrder metadata for pinned garment card & header
+    let saleOrder = null;
+    if (/^\d+$/.test(cleanId)) {
+      saleOrder = await SaleOrder.findByPk(parseInt(cleanId, 10), {
+        include: [
+          { model: Order, as: "order" },
+          { model: Product, as: "product" },
+          { model: VendorLogin, as: "vendor" },
+          {
+            model: ProductMaterial,
+            as: "material",
+            include: [{ model: ProductMaterialImage, as: "images" }],
+          },
+        ],
+      });
+    }
 
-    const formattedMessages = messages.map((msg) => {
-      const msgData = msg.toJSON ? msg.toJSON() : { ...msg };
-      if (
-        msgData.messageType === "image" ||
-        msgData.messageType === "file" ||
-        (typeof msgData.message === "string" && msgData.message.startsWith("chatUploads/"))
-      ) {
-        msgData.message = buildFileUrl(msgData.message);
+    if (!saleOrder) {
+      // Look up parent Order by order_id (e.g. 'ORD1117')
+      const matchedOrder = await Order.findOne({ where: { order_id: cleanId } });
+      if (matchedOrder) {
+        saleOrder = await SaleOrder.findOne({
+          where: { order_id: matchedOrder.id },
+          include: [
+            { model: Order, as: "order" },
+            { model: Product, as: "product" },
+            { model: VendorLogin, as: "vendor" },
+            {
+              model: ProductMaterial,
+              as: "material",
+              include: [{ model: ProductMaterialImage, as: "images" }],
+            },
+          ],
+        });
       }
-      return msgData;
+    }
+
+    if (!saleOrder && /^\d+$/.test(cleanId)) {
+      saleOrder = await SaleOrder.findOne({
+        where: { order_id: parseInt(cleanId, 10) },
+        include: [
+          { model: Order, as: "order" },
+          { model: Product, as: "product" },
+          { model: VendorLogin, as: "vendor" },
+          {
+            model: ProductMaterial,
+            as: "material",
+            include: [{ model: ProductMaterialImage, as: "images" }],
+          },
+        ],
+      });
+    }
+
+    const actualSaleOrderId = saleOrder ? saleOrder.id : (parseInt(cleanId, 10) || cleanId);
+    const lookupIds = Array.from(new Set([cleanId, String(actualSaleOrderId), actualSaleOrderId])).filter(Boolean);
+
+    let orderInfo = null;
+    if (saleOrder) {
+      let productImage = null;
+      if (saleOrder.material?.images?.length > 0) {
+        productImage = buildFileUrl(saleOrder.material.images[0].img_path);
+      } else if (saleOrder.product?.image_path) {
+        productImage = buildFileUrl(saleOrder.product.image_path);
+      }
+
+      const statusMap = {
+        "0": "Order Placed",
+        "1": "Confirmed",
+        "2": "Atelier Stitching",
+        "3": "Dispatched",
+        "4": "Cancelled",
+        "5": "Delivered",
+        "6": "Return Initiated",
+        "7": "Product Collected",
+        "8": "Refund Processed",
+      };
+      const statusLabel =
+        saleOrder.order_history ||
+        statusMap[String(saleOrder.order_status)] ||
+        (saleOrder.cancelled_at ? "Cancelled" : "Order Placed");
+
+      orderInfo = {
+        sale_order_id: saleOrder.id,
+        order_id: saleOrder.order?.order_id || `ORD${saleOrder.order_id}`,
+        product_name: saleOrder.product?.product_name || "Garment",
+        product_image: productImage,
+        size: saleOrder.size || "Standard",
+        quantity: parseInt(saleOrder.quantity || 1, 10),
+        status: statusLabel,
+        order_status: statusLabel,
+        vendor_id: saleOrder.vendor_id || (saleOrder.vendor?.id) || 1,
+        vendor_name: saleOrder.vendor?.brand_business_name || saleOrder.vendor?.shop_name || saleOrder.vendor?.seller_name || "Bespoke Vendor",
+        vendor_shop_name: saleOrder.vendor?.shop_name || "Bespoke Support",
+        vendor_image: saleOrder.vendor?.img_path ? buildFileUrl(saleOrder.vendor.img_path) : null,
+      };
+    }
+
+    // 2. Fetch all messages from ticket_messages for tickets associated with this sale_order_id
+    const tickets = await Ticket.findAll({
+      where: {
+        sale_order_id: { [Op.in]: lookupIds },
+      },
+      order: [["id", "ASC"]],
     });
+    const ticketIds = tickets.map((t) => t.id);
+
+    let ticketMessages = [];
+    if (ticketIds.length > 0) {
+      ticketMessages = await TicketMessage.findAll({
+        where: { ticket_id: { [Op.in]: ticketIds }, deleted_at: null },
+        order: [["id", "ASC"]],
+      });
+    }
+
+    // 3. Fallback to `messages` table ONLY if ticket_messages is empty
+    let legacyMessages = [];
+    if (ticketMessages.length === 0) {
+      legacyMessages = await Message.findAll({
+        where: {
+          sale_order_id: { [Op.in]: lookupIds },
+        },
+        order: [["id", "ASC"]],
+      });
+    }
+
+    const normalizeDate = (rawDate) => {
+      if (!rawDate) return new Date().toISOString();
+      const d = new Date(rawDate);
+      if (d.getTime() > Date.now() + 60000) {
+        return new Date(d.getTime() - (5.5 * 60 * 60 * 1000)).toISOString();
+      }
+      return d.toISOString();
+    };
+
+    // 4. Combine and format messages
+    const sourceList = ticketMessages.length > 0
+      ? ticketMessages.map((m) => {
+          const j = m.toJSON();
+          const fileUrl = j.file_path ? buildFileUrl(j.file_path) : null;
+          const normDate = normalizeDate(j.created_at);
+          return {
+            id: `tkt_${j.id}`,
+            raw_id: j.id,
+            ticket_id: j.ticket_id,
+            sale_order_id: actualSaleOrderId,
+            sender_id: String(j.sender_id),
+            senderId: String(j.sender_id),
+            sender_type: j.sender_type,
+            senderType: j.sender_type,
+            receiver_id: String(j.receiver_id),
+            receiverId: String(j.receiver_id),
+            receiver_type: j.receiver_type,
+            receiverType: j.receiver_type,
+            message: j.message || fileUrl || "",
+            message_type: fileUrl ? "image" : "text",
+            messageType: fileUrl ? "image" : "text",
+            file_path: fileUrl,
+            created_at: normDate,
+            createdAt: normDate,
+          };
+        })
+      : legacyMessages.map((msg) => {
+          const j = msg.toJSON();
+          const isImg = j.messageType === "image" || (typeof j.message === "string" && j.message.startsWith("chatUploads/"));
+          const fileUrl = isImg ? buildFileUrl(j.message) : null;
+          const normDate = normalizeDate(j.createdAt);
+          return {
+            id: `msg_${j.id}`,
+            raw_id: j.id,
+            sale_order_id: actualSaleOrderId,
+            sender_id: String(j.senderId),
+            senderId: String(j.senderId),
+            sender_type: j.senderType || "customer",
+            senderType: j.senderType || "customer",
+            receiver_id: String(j.receiverId),
+            receiverId: String(j.receiverId),
+            receiver_type: j.receiverType || "vendor",
+            receiverType: j.receiverType || "vendor",
+            message: fileUrl || j.message,
+            message_type: fileUrl ? "image" : (j.messageType || "text"),
+            messageType: fileUrl ? "image" : (j.messageType || "text"),
+            file_path: fileUrl,
+            created_at: normDate,
+            createdAt: normDate,
+          };
+        });
+
+    // Strictly sort by raw auto-increment id ASC for guaranteed chronological order
+    sourceList.sort((a, b) => (a.raw_id || 0) - (b.raw_id || 0));
+
+    // Deduplicate consecutive identical messages
+    const uniqueFormatted = [];
+    for (let i = 0; i < sourceList.length; i++) {
+      const curr = sourceList[i];
+      const prev = uniqueFormatted[uniqueFormatted.length - 1];
+      if (
+        prev &&
+        prev.message === curr.message &&
+        prev.sender_id === curr.sender_id &&
+        Math.abs(new Date(prev.created_at).getTime() - new Date(curr.created_at).getTime()) < 15000
+      ) {
+        continue;
+      }
+      uniqueFormatted.push(curr);
+    }
+
+    const activeTicket = tickets[tickets.length - 1] || tickets[0] || null;
+    if (orderInfo && activeTicket) {
+      orderInfo.ticket_id = activeTicket.id;
+      orderInfo.ticket_code = activeTicket.ticket_code;
+    }
 
     res.status(200).json({
       success: true,
-      sale_order_id: saleOrderId,
-      data: formattedMessages,
+      sale_order_id: actualSaleOrderId,
+      ticket_id: activeTicket?.id || null,
+      ticket_code: activeTicket?.ticket_code || null,
+      order: orderInfo,
+      messages: uniqueFormatted,
+      data: uniqueFormatted,
     });
   } catch (error) {
     console.error("Error fetching order chat history:", error);
@@ -247,155 +469,244 @@ export const getOrderChatHistory = async (req, res) => {
 
 export const sendMessage = async (req, res) => {
   try {
-    const {
-      senderId,
-      receiverId,
-      message,
-      messageType = "text",
-      chatType = "private",
-      senderType,
-      receiverType,
-      sender_type,
-      receiver_type,
-      chat_type,
-      sale_order_id,
-      saleOrderId,
-      order_id,
-      orderId: bodyOrderId,
-      roomId,
-      room_id,
-      room,
-      ticket_id,
-      ticketId,
-      target_type,
-      targetType,
-      target_id,
-      targetId,
-    } = req.body;
+    const senderId = req.body.senderId || req.body.sender_id || req.body.sender;
+    const receiverId = req.body.receiverId || req.body.receiver_id || req.body.receiver;
+    const message = req.body.message || req.body.text || req.body.msg || "";
+    const filePath = req.body.file_path || req.body.filePath || null;
+    const messageType = req.body.messageType || req.body.message_type || (filePath ? "image" : "text");
+    const chatType = req.body.chatType || req.body.chat_type || "private";
+    const senderType = req.body.senderType || req.body.sender_type || (String(senderId).toLowerCase().includes("admin") ? "admin" : "customer");
+    const receiverType = req.body.receiverType || req.body.receiver_type || (String(receiverId).toLowerCase().includes("admin") ? "admin" : "vendor");
+    const orderId = req.body.sale_order_id || req.body.saleOrderId || req.body.order_id || req.body.orderId || null;
+    let targetRoomId = req.body.roomId || req.body.room_id || req.body.room || null;
+    const ticketId = req.body.ticket_id || req.body.ticketId || null;
+    const vendorId = req.body.vendor_id || req.body.vendorId || null;
 
-    if (!senderId || !receiverId || !message) {
-      return res.status(400).json({ error: "senderId, receiverId, and message are required" });
-    }
-
-    const orderId = sale_order_id || saleOrderId || order_id || bodyOrderId || null;
-    let targetRoomId = roomId || room_id || room || null;
-
-    const tType = target_type || targetType;
-    const tId = target_id || targetId;
-
-    if (!targetRoomId && orderId && tType && tId) {
-      targetRoomId = buildOrderRoomId({
-        saleOrderId: orderId,
-        targetType: tType,
-        targetId: tId
-      });
+    if (!senderId || !receiverId || (!message && !filePath)) {
+      return res.status(400).json({ error: "senderId, receiverId, and message (or filePath) are required" });
     }
 
     const isOrderChat = Boolean(
-      targetRoomId ||
       orderId ||
-      ticket_id ||
       ticketId ||
       chatType === "order" ||
-      chat_type === "order" ||
       (targetRoomId && String(targetRoomId).startsWith("order_"))
     );
 
-    // --- A. IF ORDER CHAT: SAVE ONLY IN ticket_messages TABLE ---
-    if (isOrderChat) {
-      console.log(`🎫 Routing order message strictly to ticket_messages table (Room: ${targetRoomId || 'N/A'}, Order: ${orderId || 'N/A'})`);
-      const ticketRes = await saveTicketMessageHelper({
-        ticketId: ticket_id || ticketId,
-        saleOrderId: orderId,
-        senderId,
-        senderType: senderType || sender_type,
-        receiverId,
-        receiverType: receiverType || receiver_type,
-        message,
-        filePath: (messageType === "image" || messageType === "file") ? message : null,
-        targetType: tType || (targetRoomId?.includes("vendor") ? "vendor" : "customer"),
+    // --- A. ORDER CHAT: STORE IN messages TABLE (FOR ADMIN CHAT PANEL) & ticket_messages ---
+    if (isOrderChat && orderId) {
+      console.log(`🎫 Processing order chat for Admin & Customer (Order: ${orderId})`);
+
+      const cleanOrderId = String(orderId).trim();
+      let saleOrder = null;
+      if (/^\d+$/.test(cleanOrderId)) {
+        try {
+          saleOrder = await SaleOrder.findByPk(parseInt(cleanOrderId, 10));
+        } catch (e) {}
+      }
+      if (!saleOrder) {
+        try {
+          const matchedOrder = await Order.findOne({ where: { order_id: cleanOrderId } });
+          if (matchedOrder) {
+            saleOrder = await SaleOrder.findOne({
+              where: { order_id: matchedOrder.id },
+              include: [{ model: Order, as: "order" }],
+            });
+          }
+        } catch (e) {}
+      }
+
+      const actualSaleOrderId = saleOrder ? saleOrder.id : (parseInt(cleanOrderId, 10) || cleanOrderId);
+      const resolvedVendorId = vendorId || saleOrder?.vendor_id || 1;
+      const cleanSenderId = parseInt(String(senderId).replace(/[^0-9]/g, ""), 10) || 76;
+      const cleanReceiverId = parseInt(String(receiverId).replace(/[^0-9]/g, ""), 10) || 1;
+
+      // 1. Deduplication check in messages table
+      let savedOrderMsg = await Message.findOne({
+        where: {
+          senderId: String(senderId),
+          sale_order_id: actualSaleOrderId,
+          message: message || (filePath ? filePath : ""),
+          createdAt: { [Op.gte]: new Date(Date.now() - 3000) },
+        },
       });
 
-      const orderMsgData = ticketRes?.ticketMessage ? ticketRes.ticketMessage.toJSON() : { ...req.body };
-      orderMsgData.roomId = targetRoomId;
-      orderMsgData.room_id = targetRoomId;
-      orderMsgData.sale_order_id = orderId;
-      orderMsgData.text = orderMsgData.message;
-      if (ticketRes?.ticket) {
-        orderMsgData.ticket_id = ticketRes.ticket.id;
-        orderMsgData.ticket_code = ticketRes.ticket.ticket_code;
-      }
-      if (orderMsgData.file_path) {
-        orderMsgData.file_path = buildFileUrl(orderMsgData.file_path);
-        orderMsgData.message = orderMsgData.file_path;
-      }
-
-      if (targetRoomId) {
-        emitToRoom(targetRoomId, "receive_order_message", orderMsgData);
+      if (!savedOrderMsg) {
+        savedOrderMsg = await Message.create({
+          senderId: String(senderId),
+          receiverId: String(receiverId || "1"),
+          message: message || (filePath ? filePath : ""),
+          messageType: messageType || (filePath ? "image" : "text"),
+          chatType: "customer_and_admin",
+          senderType: senderType || "customer",
+          receiverType: receiverType || "admin",
+          sale_order_id: actualSaleOrderId,
+          room_id: null,
+          isRead: false,
+          status: "sent",
+        });
       }
 
-      emitToUser(String(receiverId), "order_chat_notification", {
-        roomId: targetRoomId,
-        sale_order_id: orderId,
+      // 2. Also ensure ticket record exists
+      let ticket = null;
+      if (ticketId) {
+        ticket = await Ticket.findByPk(ticketId);
+      }
+      if (!ticket) {
+        ticket = await Ticket.findOne({
+          where: {
+            sale_order_id: { [Op.in]: [actualSaleOrderId, cleanOrderId] },
+            status: "open",
+          },
+        });
+      }
+      if (!ticket) {
+        ticket = await Ticket.create({
+          sale_order_id: actualSaleOrderId,
+          ticket_code: `TKT-${actualSaleOrderId}-${Math.floor(1000 + Math.random() * 9000)}`,
+          vendor_id: resolvedVendorId,
+          ticket_type: "order",
+          priority: "medium",
+          status: "open",
+        });
+      }
+
+      // 3. Save ticket message record
+      let savedTicketMessage = await TicketMessage.findOne({
+        where: {
+          ticket_id: ticket.id,
+          sender_id: cleanSenderId,
+          message: message || null,
+          created_at: { [Op.gte]: new Date(Date.now() - 3000) },
+        },
+      });
+
+      if (!savedTicketMessage) {
+        savedTicketMessage = await TicketMessage.create({
+          ticket_id: ticket.id,
+          sender_id: cleanSenderId,
+          sender_type: senderType,
+          receiver_id: cleanReceiverId,
+          receiver_type: receiverType,
+          message: message || null,
+          file_path: filePath || null,
+        });
+      }
+
+      const fileUrl = (savedOrderMsg.messageType === "image" || savedOrderMsg.messageType === "file" || (typeof savedOrderMsg.message === "string" && savedOrderMsg.message.startsWith("chatUploads/")))
+        ? buildFileUrl(savedOrderMsg.message)
+        : (savedTicketMessage.file_path ? buildFileUrl(savedTicketMessage.file_path) : null);
+
+      const orderMsgData = {
+        id: savedOrderMsg.id,
+        message_id: savedOrderMsg.id,
+        ticket_id: ticket.id,
+        ticket_code: ticket.ticket_code,
+        sale_order_id: actualSaleOrderId,
+        saleOrderId: actualSaleOrderId,
+        sender_id: String(senderId),
         senderId: String(senderId),
-        message: orderMsgData
-      });
+        sender_type: senderType,
+        senderType: senderType,
+        receiver_id: String(receiverId || "1"),
+        receiverId: String(receiverId || "1"),
+        receiver_type: receiverType,
+        receiverType: receiverType,
+        message: savedOrderMsg.message || fileUrl || "",
+        text: savedOrderMsg.message || fileUrl || "",
+        file_path: fileUrl,
+        message_type: fileUrl ? "image" : "text",
+        messageType: fileUrl ? "image" : "text",
+        created_at: savedOrderMsg.createdAt,
+        createdAt: savedOrderMsg.createdAt,
+      };
+
+      // Realtime broadcasts
+      emitToOrder(actualSaleOrderId, "receive_order_message", orderMsgData);
+      emitToOrder(actualSaleOrderId, "receive_message", orderMsgData);
+      emitToRoom(`order_vendor_${actualSaleOrderId}`, "receive_order_message", orderMsgData);
+      emitToRoom(`order_${actualSaleOrderId}`, "receive_order_message", orderMsgData);
+      if (cleanOrderId && cleanOrderId !== String(actualSaleOrderId)) {
+        emitToOrder(cleanOrderId, "receive_order_message", orderMsgData);
+        emitToRoom(`order_vendor_${cleanOrderId}`, "receive_order_message", orderMsgData);
+      }
+      emitToUser(String(receiverId), "receive_order_message", orderMsgData);
+      emitToUser(String(receiverId), "receive_message", orderMsgData);
+      emitToUser("admin", "receive_order_message", orderMsgData);
+      emitToUser("admin", "receive_message", orderMsgData);
+      emitToUser("1", "receive_order_message", orderMsgData);
+      emitToUser("1", "receive_message", orderMsgData);
+      emitToUser(String(senderId), "receive_order_message", orderMsgData);
+      emitToUser(String(senderId), "receive_message", orderMsgData);
 
       return res.status(201).json({
         success: true,
-        message: "Order chat message stored successfully in ticket_messages",
+        message: "Order chat message stored successfully",
         data: orderMsgData,
       });
     }
 
-    // STRICT SAFETY: Do NOT store any order message in messages table
-    if (orderId || (targetRoomId && String(targetRoomId).startsWith("order_")) || ticket_id || ticketId) {
-      console.warn("⚠️ Blocked order message from reaching messages table!");
-      return res.status(400).json({ error: "Order messages must not be stored in messages table" });
-    }
+    // --- B. CUSTOMER SUPPORT CHAT (ADMIN <-> CUSTOMER): STORE STRICTLY IN messages TABLE ---
+    const cleanSenderStr = String(senderId);
+    const cleanReceiverStr = String(receiverId);
+    const rawMsgContent = message || (filePath ? filePath : "");
+    const resolvedTempId = req.body.temp_id || req.body.tempId || null;
 
-    // --- B. NORMAL 1-ON-1 DIRECT CHAT: SAVE ONLY IN messages TABLE ---
-    const savedMessage = await Message.create({
-      senderId: String(senderId),
-      receiverId: String(receiverId),
-      message,
-      messageType,
-      chatType: chatType || chat_type || "private",
-      senderType: senderType || sender_type || null,
-      receiverType: receiverType || receiver_type || null,
-      sale_order_id: null,
-      room_id: null,
-      isRead: false,
-      status: "sent",
+    let savedMessage = await Message.findOne({
+      where: {
+        senderId: cleanSenderStr,
+        receiverId: cleanReceiverStr,
+        message: rawMsgContent,
+        createdAt: { [Op.gte]: new Date(Date.now() - 3000) },
+      },
     });
 
-    const messageData = savedMessage.toJSON();
-    messageData.roomId = targetRoomId;
-    messageData.room_id = targetRoomId;
-
-    if (
-      messageData.messageType === "image" ||
-      messageData.messageType === "file" ||
-      (typeof messageData.message === "string" && messageData.message.startsWith("chatUploads/"))
-    ) {
-      messageData.message = buildFileUrl(messageData.message);
-    }
-
-    if (targetRoomId) {
-      // Broadcast exclusively to the isolated order chat room
-      emitToRoom(targetRoomId, "receive_order_message", messageData);
-
-      // Notification to receiver without cluttering normal 1-on-1 private chat
-      emitToUser(String(receiverId), "order_chat_notification", {
-        roomId: targetRoomId,
-        sale_order_id: orderId,
-        senderId: String(senderId),
-        message: messageData
+    if (!savedMessage) {
+      savedMessage = await Message.create({
+        senderId: cleanSenderStr,
+        receiverId: cleanReceiverStr,
+        message: rawMsgContent,
+        messageType: messageType || (filePath ? "image" : "text"),
+        chatType: chatType || "private",
+        senderType: senderType || "customer",
+        receiverType: receiverType || "admin",
+        sale_order_id: null,
+        room_id: null,
+        isRead: false,
+        status: "sent",
       });
-    } else {
-      // Normal direct chat
-      emitToUser(String(receiverId), "receive_message", messageData);
     }
+
+    const fileUrl = (savedMessage.messageType === "image" || savedMessage.messageType === "file" || (typeof savedMessage.message === "string" && savedMessage.message.startsWith("chatUploads/")))
+      ? buildFileUrl(savedMessage.message)
+      : null;
+
+    const messageData = {
+      ...savedMessage.toJSON(),
+      id: savedMessage.id,
+      sender_id: String(savedMessage.senderId),
+      senderId: String(savedMessage.senderId),
+      receiver_id: String(savedMessage.receiverId),
+      receiverId: String(savedMessage.receiverId),
+      message: fileUrl || savedMessage.message,
+      text: savedMessage.message,
+      file_path: fileUrl,
+      created_at: savedMessage.createdAt,
+      createdAt: savedMessage.createdAt,
+      message_type: savedMessage.messageType,
+      messageType: savedMessage.messageType,
+      temp_id: resolvedTempId,
+      tempId: resolvedTempId,
+    };
+
+    // If receiver is admin or 1, emit to admin channel
+    const cleanRId = String(receiverId).replace(/^(customer_|vendor_|admin_)/, "");
+    if (cleanRId === "1" || String(receiverId).toLowerCase().includes("admin")) {
+      emitToAdmin("receive_message", messageData);
+      emitToUser("1", "receive_message", messageData);
+      emitToUser("admin", "receive_message", messageData);
+    }
+    emitToUser(String(receiverId), "receive_message", messageData);
 
     res.status(201).json({
       success: true,
@@ -678,6 +989,7 @@ export const getConversations = async (req, res) => {
         username: otherId,
         status: "offline",
         unreadCount: unreadCount,
+        sale_order_id: lastMsg.sale_order_id || null,
         lastMessage: lastMsg.messageType === "image" ? "📷 Image" : lastMsg.message,
         lastMessageTime: new Date(lastMsg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         email: email,

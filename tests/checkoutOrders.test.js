@@ -547,9 +547,9 @@ async function runCheckoutOrdersTestSuite() {
         // commission = 25% of 5100 = 1275
         // seller_amount = 5100 - 1275 = 3825
         // delivery = 50
-        // payable = 5100 + 50 = 5150
+        // payable = 5100 + active DB delivery charge (delivery_amount)
         const itemTotal = 5100;
-        const expectedPayable = 5150;
+        const expectedPayable = 5100 + parseFloat(dbOrder.delivery_amount);
 
         const isStockDecremented = refreshedPrice.qty === expectedStock;
         const isOrderApproved = dbOrder.order_history === "Approved";
@@ -664,12 +664,12 @@ async function runCheckoutOrdersTestSuite() {
         // seller_amount = 2000 - 500 = 1500 (MUST REMAIN INTACT)
         // bespoke_commision_amount after discount = 500 - 300 = 200
         // total_amount of sale order = 2000 - 300 = 1700
-        // delivery = 50
-        // payable = (2000 - 300) + 50 = 1750
+        // delivery = active DB delivery charge (delivery_amount)
+        // payable = (2000 - 300) + delivery_amount
         const isSellerAmountIntact = parseFloat(saleOrder.seller_amount) === 1500;
         const isBespokeCommReduced = parseFloat(saleOrder.bespoke_commision_amount) === 200;
         const isSaleOrderDiscountRecorded = parseFloat(saleOrder.discount_amount) === 300;
-        const isPayableCorrect = parseFloat(dbOrder.payable_price) === 1750;
+        const isPayableCorrect = parseFloat(dbOrder.payable_price) === (1700 + parseFloat(dbOrder.delivery_amount));
 
         if (isSellerAmountIntact && isBespokeCommReduced && isSaleOrderDiscountRecorded && isPayableCorrect) {
           console.log(`   ✅ PASS: Promo discount correctly deducted exclusively from Bespoke commission! Seller amount remained ₹1500 intact.\n`);

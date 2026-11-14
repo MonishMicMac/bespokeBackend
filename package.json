@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "node tests/customerModule.test.js && node tests/homepageDiscovery.test.js && node tests/productCatalog.test.js && node tests/vendorDesigner.test.js && node tests/shoppingCart.test.js && node tests/userFavorites.test.js && node tests/deliveryAddresses.test.js && node tests/bespokeMeasurements.test.js && node tests/couponsDiscounts.test.js && node tests/checkoutOrders.test.js && node tests/customerReviews.test.js",
+    "test": "node tests/customerModule.test.js && node tests/homepageDiscovery.test.js && node tests/productCatalog.test.js && node tests/vendorDesigner.test.js && node tests/shoppingCart.test.js && node tests/userFavorites.test.js && node tests/deliveryAddresses.test.js && node tests/bespokeMeasurements.test.js && node tests/customMeasurementsEngine.test.js && node tests/couponsDiscounts.test.js && node tests/checkoutOrders.test.js && node tests/customerReviews.test.js",
     "test:customer": "node tests/customerModule.test.js",
     "test:homepage": "node tests/homepageDiscovery.test.js",
     "test:catalog": "node tests/productCatalog.test.js",
@@ -14,10 +14,12 @@
     "test:cart": "node tests/shoppingCart.test.js",
     "test:wishlist": "node tests/userFavorites.test.js",
     "test:address": "node tests/deliveryAddresses.test.js",
-    "test:measurement": "node tests/bespokeMeasurements.test.js",
+    "test:measurement": "node tests/bespokeMeasurements.test.js && node tests/customMeasurementsEngine.test.js",
     "test:coupon": "node tests/couponsDiscounts.test.js",
     "test:order": "node tests/checkoutOrders.test.js",
     "test:review": "node tests/customerReviews.test.js",
+    "test:notifications": "node tests/notificationSystem.test.js",
+    "test:invoice": "node tests/invoiceSystem.test.js",
     "test:all": "node tests/customerModule.test.js && node tests/homepageDiscovery.test.js && node tests/productCatalog.test.js && node tests/vendorDesigner.test.js && node tests/shoppingCart.test.js && node tests/userFavorites.test.js && node tests/deliveryAddresses.test.js && node tests/bespokeMeasurements.test.js && node tests/couponsDiscounts.test.js && node tests/checkoutOrders.test.js && node tests/customerReviews.test.js"
   },
   "keywords": [],
@@ -35,6 +37,7 @@
     "multer": "^2.2.0",
     "mysql2": "^3.22.5",
     "nodemailer": "^9.0.3",
+    "pdfkit": "^0.20.2",
     "razorpay": "^2.9.8",
     "redis": "^5.10.0",
     "sequelize": "^6.37.8",
@@ -43,6 +46,7 @@
     "uuid": "^14.0.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.1.11",
+    "socket.io-client": "^4.8.4"
   }
 }

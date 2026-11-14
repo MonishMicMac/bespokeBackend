@@ -15,10 +15,24 @@ export const saleOrderController = async (req, res) => {
     }
 
     const resolvedEnum = resolveOrderHistoryEnum(order_history);
+    const numericMap = {
+      Pending: "0",
+      Approved: "1",
+      Ready_to_Ship: "2",
+      Dispatched: "3",
+      Decline_Order: "4",
+      Delivered: "5",
+      Returned: "8",
+      material_procurement: "2",
+      Design_Approved: "2",
+      Production_Started: "2",
+    };
+    const numericCode = numericMap[resolvedEnum] || (String(order_history).trim() === "5" || resolvedEnum === "Delivered" ? "5" : "0");
 
     // 1. Create the history record in sale_order_history table
     const newRecord = await SaleOrderHistory.create({
       sale_order_id: id,
+      order_status: numericCode,
       order_history: resolvedEnum,
       remarks: cancel_remark || null
     });
@@ -28,6 +42,7 @@ export const saleOrderController = async (req, res) => {
     // 2. Update the main sale_order table
     const [updatedCount] = await SaleOrder.update(
       {
+        order_status: numericCode,
         order_history: resolvedEnum,
         ...(resolvedEnum === 'Decline_Order' && { cancel_remark: cancel_remark || null })
       },

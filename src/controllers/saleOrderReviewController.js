@@ -14,10 +14,22 @@ class SaleOrderReviewController {
       const body = req.body || {};
       const query = req.query || {};
 
-      const saleOrderId = body.sale_order_id || query.sale_order_id;
+      const saleOrderId = body.sale_order_id || query.sale_order_id || body.saleOrderId || query.saleOrderId;
+      const productId = body.product_id || query.product_id || body.productId || query.productId;
       const userId = body.user_id || query.user_id || req.user?.id;
       const ratings = body.ratings !== undefined ? body.ratings : (body.rating !== undefined ? body.rating : query.ratings);
       const reviewText = body.review !== undefined ? body.review : (body.comments !== undefined ? body.comments : query.review);
+      const deletedImageIds = body.deleted_image_ids || body.deletedImageIds || query.deleted_image_ids;
+
+      // Derive authenticated user ID from req.user or Authorization header
+      let authenticatedUserId = req.user?.id || null;
+      const authHeader = req.headers.authorization || req.headers.Authorization;
+      if (!authenticatedUserId && authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7).trim();
+        if (/^\d+$/.test(token)) {
+          authenticatedUserId = parseInt(token, 10);
+        }
+      }
 
       // Collect multipart files if present
       let files = [];
@@ -37,20 +49,28 @@ class SaleOrderReviewController {
 
       // Collect base64 images if present in body (and not multipart)
       let base64Images = [];
+      const isBase64String = (str) =>
+        typeof str === "string" &&
+        (str.startsWith("data:image/") || (!str.startsWith("http://") && !str.startsWith("https://") && str.length > 200));
+
       if (body.images && files.length === 0) {
-        base64Images = Array.isArray(body.images) ? body.images : [body.images];
+        const raw = Array.isArray(body.images) ? body.images : [body.images];
+        base64Images = raw.filter(isBase64String);
       } else if (body.image && files.length === 0) {
-        base64Images = [body.image];
+        const raw = Array.isArray(body.image) ? body.image : [body.image];
+        base64Images = raw.filter(isBase64String);
       }
 
       const result = await SaleOrderReviewService.storeReview({
         sale_order_id: saleOrderId,
+        product_id: productId,
         user_id: userId,
         ratings,
         review: reviewText,
         files,
         base64Images,
-        authenticatedUserId: req.user?.id || null,
+        deleted_image_ids: deletedImageIds,
+        authenticatedUserId,
       });
 
       return res.status(result.statusCode).json(result.body);

@@ -1,6 +1,7 @@
 import { redisClient } from "../redis/redisClient.js";
 import SaleOrderHistory from "../../models/SaleOrderHistory.js";
 import SaleOrder from "../../models/SaleOrder.js";
+import DeliveryCharge from "../../models/DeliveryCharge.js";
 import { emitToAll } from "../sockets/socket.js";
 import sequelize from "../../config/db.js";
 import { QueryTypes } from "sequelize";
@@ -14,6 +15,7 @@ const ENUM_MAPPING = {
   "ready to ship": "Ready_to_Ship",
   ready_to_ship: "Ready_to_Ship",
   dispatched: "Dispatched",
+  delivered: "Delivered",
   "decline order": "Decline_Order",
   decline_order: "Decline_Order",
   declined: "Decline_Order",
@@ -31,9 +33,24 @@ const INT_TO_ENUM = {
   2: "Ready_to_Ship",
   3: "Dispatched",
   4: "Decline_Order",
-  7: "material_procurement",
-  8: "Design_Approved",
+  5: "Delivered",
+  6: "Dispatched",
+  7: "Dispatched",
+  8: "Returned",
   9: "Production_Started",
+};
+
+const ENUM_TO_NUMERIC = {
+  Pending: "0",
+  Approved: "1",
+  Ready_to_Ship: "2",
+  Dispatched: "3",
+  Decline_Order: "4",
+  Delivered: "5",
+  Returned: "8",
+  material_procurement: "2",
+  Design_Approved: "2",
+  Production_Started: "2",
 };
 
 export const resolveOrderHistoryEnum = (status) => {
@@ -84,15 +101,18 @@ export const updateOrderStatus = async (req, res) => {
     }
 
     const resolvedEnum = resolveOrderHistoryEnum(order_history);
+    const numericCode = ENUM_TO_NUMERIC[resolvedEnum] || (String(order_history).trim() === "5" || resolvedEnum === "Delivered" ? "5" : "0");
 
     const newRecord = await SaleOrderHistory.create({
       sale_order_id: id,
+      order_status: numericCode,
       order_history: resolvedEnum,
       remarks: cancel_remark || null,
     });
 
     await SaleOrder.update(
       {
+        order_status: numericCode,
         order_history: resolvedEnum,
         ...(resolvedEnum === "Decline_Order" && { cancel_remark: cancel_remark || null }),
       },
@@ -152,7 +172,7 @@ export const order = async (req, res) => {
     const productsData = req.body.product || [];
     const cartIds = req.body.cart_id || [];
     const addressId = req.body.address_id;
-    const couponCode = req.body.coupen_id || req.body.coupon_code || null;
+    const couponCode = req.body.coupon_code || req.body.code || req.body.coupen_id || null;
     const paymentMode = req.body.payment_mode;
 
     const result = await OrderService.createOrder({
@@ -320,6 +340,33 @@ export const handleRazorpayWebhook = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/delivery-charge
+ * Retrieve active delivery charge from DB (table: delivery_charge)
+ */
+export const getDeliveryCharge = async (req, res) => {
+  try {
+    const chargeRow = await DeliveryCharge.findOne();
+    const deliveryAmount = chargeRow ? parseFloat(chargeRow.delivery_amount) : 0;
+    return res.status(200).json({
+      status: true,
+      message: "Delivery charge retrieved successfully",
+      data: {
+        id: chargeRow ? chargeRow.id : 1,
+        delivery_amount: deliveryAmount,
+        created_at: chargeRow?.created_at,
+        updated_at: chargeRow?.updated_at,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching delivery charge:", err);
+    return res.status(500).json({
+      status: false,
+      message: "Failed to retrieve delivery charge",
+    });
+  }
+};
+
 export default {
   resolveOrderHistoryEnum,
   getOrderById,
@@ -330,4 +377,5 @@ export default {
   getUserOrders,
   getUserOrderDetailMobile,
   handleRazorpayWebhook,
+  getDeliveryCharge,
 };

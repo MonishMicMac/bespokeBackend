@@ -166,8 +166,19 @@ export async function showCustomerMeasurements({
   nameId,
   authenticatedUserId,
 }) {
-  const effectiveCustId = userId || custId;
+  const effectiveCustId = userId || custId || null;
   const filterProfileId = customerMeasurementNameId || nameId || null;
+
+  if (!effectiveCustId) {
+    return {
+      statusCode: 404,
+      body: {
+        status: false,
+        message: "No measurements found for this customer.",
+        data: [],
+      },
+    };
+  }
 
   // Security check: Must not allow accessing another user's measurements
   if (authenticatedUserId && String(authenticatedUserId) !== String(effectiveCustId)) {
@@ -784,6 +795,37 @@ export async function getMeasurementNames(userId) {
       status: true,
       message: "Customer measurement profiles retrieved successfully.",
       data: profiles,
+    },
+  };
+}
+
+/**
+ * Delete an entire measurement profile and its linked measurements
+ * Method: CustomerMeasurementController::deleteProfile()
+ * POST/DELETE /api/customer-measurement/delete
+ */
+export async function deleteProfile(profileId) {
+  const profile = await CustomerMeasurementName.findByPk(profileId);
+  if (!profile) {
+    return {
+      statusCode: 404,
+      body: {
+        status: false,
+        message: "Measurement profile not found.",
+      },
+    };
+  }
+
+  await CustomerMeasurement.destroy({
+    where: { customer_measurement_name_id: profileId },
+  });
+  await profile.destroy();
+
+  return {
+    statusCode: 200,
+    body: {
+      status: true,
+      message: "Measurement profile and associated measurements deleted successfully.",
     },
   };
 }

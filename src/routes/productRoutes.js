@@ -1,5 +1,8 @@
 import express from "express";
+import upload from "../middleware/upload.js";
 import * as productCatalogController from "../controllers/productCatalogController.js";
+import * as vendorProductController from "../controllers/vendorProductController.js";
+import { getProductRecommendations } from "../controllers/recommendationController.js";
 import {
   getProducts,
   getProductById,
@@ -13,6 +16,22 @@ import {
 const router = express.Router();
 
 // Products & Catalog endpoints (Laravel equivalent)
+router.post(
+  ["/add/product/web", "/product/add/web"],
+  upload.any(),
+  vendorProductController.addProductWeb
+);
+router.post(
+  ["/update/product/web", "/product/update/web"],
+  upload.any(),
+  vendorProductController.updateProductWeb
+);
+
+router.get(
+  ["/product/edit/:id", "/product/edit", "/vendor/product/edit/:id"],
+  vendorProductController.getProductEditDetails
+);
+
 router.get("/show/product", productCatalogController.getProductDetails);
 router.get("/product/list", productCatalogController.getVendorProducts);
 router.get("/vendor/product/list", productCatalogController.getVendorProducts);
@@ -37,6 +56,11 @@ router.get(
 );
 
 router.get("/products/search", productCatalogController.searchProducts);
+
+// Intelligent Product Recommendations (Relevance-based scoring)
+router.get("/products/:productId/recommendations", getProductRecommendations);
+router.get("/product/:productId/recommendations", getProductRecommendations);
+router.get("/show/product/recommendations", getProductRecommendations);
 
 // Legacy routes preserved
 router.get("/products", getProducts);

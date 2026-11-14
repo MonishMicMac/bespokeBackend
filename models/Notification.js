@@ -27,8 +27,24 @@ const Notification = sequelize.define(
       allowNull: false,
     },
     type: {
-      type: DataTypes.STRING(50), // 'order', 'refund', 'system', 'general'
+      type: DataTypes.STRING(50), // 'order', 'support', 'chat', 'refund', 'system', 'general'
       defaultValue: "order",
+    },
+    related_ticket_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+    },
+    related_message_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+    },
+    related_order_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+    },
+    related_sale_order_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
     },
     data: {
       type: DataTypes.JSON,

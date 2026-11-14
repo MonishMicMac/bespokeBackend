@@ -25,6 +25,8 @@ router.post("/:id/read", markNotificationRead);
 // Mark all notifications as read for a recipient
 router.post("/mark-all-read", markAllNotificationsRead);
 router.put("/mark-all-read", markAllNotificationsRead);
+router.post("/read-all", markAllNotificationsRead);
+router.put("/read-all", markAllNotificationsRead);
 
 // Create notification (optional / manual API)
 router.post("/", createNotification);

@@ -88,6 +88,14 @@ export async function applyPromoCode(req, res) {
       discount: result.discount,
       payable,
       promo_id: result.promo_id,
+      promo: {
+        id: result.promo_id,
+        code: result.promo_code || code,
+        discount: result.discount,
+        discount_amount: result.discount,
+        discount_type: result.promo_type || "flat",
+        value: result.promo_value,
+      },
     });
   } catch (error) {
     console.error("Error applying promo code:", error);

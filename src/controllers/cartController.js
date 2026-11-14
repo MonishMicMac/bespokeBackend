@@ -54,7 +54,7 @@ export const getCart = async (req, res) => {
        FROM user_cart_items c
        LEFT JOIN product_prices pp ON c.price_id = pp.id
        LEFT JOIN products p ON pp.product_id = p.id
-       LEFT JOIN vendor_login v ON (c.vendor_id = v.id OR p.vendor_id = v.id)
+       LEFT JOIN vendor_login v ON v.id = COALESCE(c.vendor_id, p.vendor_id)
        WHERE c.user_id = ? AND c.action = '0'
        ORDER BY c.id DESC`,
       {
@@ -382,13 +382,13 @@ export const updateCartQuantity = async (req, res) => {
 export const removeFromCart = async (req, res) => {
   try {
     const userId = req.body?.user_id || req.query?.user_id || req.body?.userId || req.query?.userId;
-    const cartItemId = req.body?.cart_item_id || req.query?.cart_item_id || req.body?.id || req.query?.id;
+    const cartItemId = req.params?.id || req.body?.cart_item_id || req.query?.cart_item_id || req.body?.id || req.query?.id;
 
     if (!cartItemId) {
       return res.status(400).json({ status: false, message: "cart_item_id is required" });
     }
 
-    // Always update by primary key id so the item is guaranteed to be deactivated
+    // 1. Deactivate by cart item primary key id
     await sequelize.query(
       `UPDATE user_cart_items SET action = '1', updated_at = NOW() WHERE id = ?`,
       {
@@ -397,6 +397,23 @@ export const removeFromCart = async (req, res) => {
       }
     );
 
+    // 2. Also deactivate if cartItemId matched a product or price ID
+    if (userId) {
+      await sequelize.query(
+        `UPDATE user_cart_items SET action = '1', updated_at = NOW() 
+         WHERE user_id = ? AND (
+           id = ? OR 
+           price_id = ? OR 
+           price_id IN (SELECT id FROM product_prices WHERE product_id = ?)
+         )`,
+        {
+          replacements: [userId, cartItemId, cartItemId, cartItemId],
+          type: QueryTypes.UPDATE,
+        }
+      );
+    }
+
+    // 3. Deactivate associated addon_cart entries
     await sequelize.query(
       `UPDATE addon_cart SET action = '1', updated_at = NOW() WHERE cart_id = ?`,
       {

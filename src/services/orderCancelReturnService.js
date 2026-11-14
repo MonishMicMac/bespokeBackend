@@ -1,4 +1,5 @@
 import sequelize from "../../config/db.js";
+import { Op } from "sequelize";
 import {
   SaleOrder,
   SaleOrderHistory,
@@ -10,6 +11,7 @@ import {
 } from "../../models/setupAssociations.js";
 import PaymentService from "./paymentService.js";
 import OrderHistoryTimelineService from "./orderHistoryTimelineService.js";
+import { emitToAll } from "../sockets/socket.js";
 
 const DEFAULT_CANCEL_REASONS = [
   "Ordered by mistake",
@@ -73,7 +75,7 @@ class OrderCancelReturnService {
     const t = await sequelize.transaction();
 
     try {
-      const saleOrder = await SaleOrder.findByPk(saleOrderId, {
+      let saleOrder = await SaleOrder.findByPk(saleOrderId, {
         include: [
           { association: "order" },
           { association: "product" },
@@ -82,6 +84,20 @@ class OrderCancelReturnService {
         transaction: t,
         lock: t.LOCK.UPDATE,
       });
+
+      if (!saleOrder) {
+        // Fallback: Check if saleOrderId is parent order_id
+        saleOrder = await SaleOrder.findOne({
+          where: { order_id: saleOrderId },
+          include: [
+            { association: "order" },
+            { association: "product" },
+            { association: "priceRelation" },
+          ],
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+      }
 
       if (!saleOrder) {
         await t.rollback();
@@ -174,18 +190,45 @@ class OrderCancelReturnService {
         }
       }
 
-      // Trigger Razorpay Refund API
+      // Resolve Payment and Trigger Razorpay Refund API
       const refundAmount = parseFloat(saleOrder.total_amount || saleOrder.amount || saleOrder.single_product_price || 0);
-      const paymentId =
+
+      let resolvedPaymentId =
         order.payment_id ||
-        order.transaction_id ||
-        order.razorpay_order_id ||
         params.payment_id ||
+        order.transaction_id ||
         params.transaction_id ||
         null;
 
-      let refundStatus = "initiated";
-      let refundTxnId = paymentId;
+      // If resolvedPaymentId does not start with "pay_", but order has razorpay_order_id, query Razorpay for payment id
+      if ((!resolvedPaymentId || !String(resolvedPaymentId).startsWith("pay_")) && order.razorpay_order_id) {
+        try {
+          const razorpay = PaymentService.getRazorpayInstance();
+          if (razorpay) {
+            const payments = await razorpay.orders.fetchPayments(order.razorpay_order_id);
+            if (payments && payments.items && payments.items.length > 0) {
+              const successfulPayment = payments.items.find(
+                (p) => p.status === "captured" || p.status === "authorized"
+              ) || payments.items[0];
+              if (successfulPayment && successfulPayment.id) {
+                resolvedPaymentId = successfulPayment.id;
+                await order.update({ payment_id: resolvedPaymentId }, { transaction: t });
+              }
+            }
+          }
+        } catch (fetchErr) {
+          console.warn("Could not fetch payments from Razorpay for order:", order.razorpay_order_id, fetchErr.message);
+        }
+      }
+
+      const isCod =
+        ["COD", "cod"].includes(String(order.payment_id)) ||
+        ["COD", "cod"].includes(String(order.transaction_id)) ||
+        ["COD", "cod"].includes(String(params.payment_id)) ||
+        (!resolvedPaymentId && !order.razorpay_order_id && order.razorpay_status !== "paid");
+
+      let refundStatus = isCod ? "not_applicable" : "initiated";
+      let refundTxnId = resolvedPaymentId || (isCod ? "COD" : null);
 
       let existingRefund = await Refund.findOne({
         where: { sale_order_id: saleOrder.id },
@@ -195,16 +238,22 @@ class OrderCancelReturnService {
       let refundRecord = null;
 
       if (!existingRefund) {
-        if (paymentId && String(paymentId).startsWith("pay_")) {
-          const razorpayResponse = await PaymentService.refundPayment(paymentId, refundAmount, {
-            sale_order_id: String(saleOrder.id),
-            order_id: String(order.id),
-            reason: `Cancel by ${cancelledBy}: ${cancelReason}`,
-          });
+        if (!isCod) {
+          const targetPaymentId = resolvedPaymentId || order.razorpay_order_id;
+          if (targetPaymentId) {
+            const razorpayResponse = await PaymentService.refundPayment(targetPaymentId, refundAmount, {
+              sale_order_id: String(saleOrder.id),
+              order_id: String(order.id),
+              reason: `Cancel by ${cancelledBy}: ${cancelReason}`,
+            });
 
-          if (razorpayResponse.success) {
-            refundTxnId = razorpayResponse.refund_id || refundTxnId;
-            refundStatus = razorpayResponse.status || "processed";
+            if (razorpayResponse.success) {
+              refundTxnId = razorpayResponse.refund_id || refundTxnId;
+              refundStatus = razorpayResponse.status || "processed";
+            } else {
+              console.error("Razorpay refund error:", razorpayResponse.error);
+              refundStatus = "initiated";
+            }
           }
         }
 
@@ -262,7 +311,43 @@ class OrderCancelReturnService {
         );
       }
 
+      // If all items for this parent order are cancelled, update parent order history
+      const remainingActiveItems = await SaleOrder.count({
+        where: {
+          order_id: order.id,
+          id: { [Op.ne]: saleOrder.id },
+          order_status: { [Op.notIn]: ["4", 4, "cancelled", "Cancelled"] },
+          order_history: { [Op.notIn]: ["Cancelled", "cancelled", "Decline_Order"] },
+        },
+        transaction: t,
+      });
+
+      if (remainingActiveItems === 0) {
+        await order.update(
+          {
+            order_history: "Decline_Order",
+            decline_remarks: cancelReason,
+          },
+          { transaction: t }
+        );
+      }
+
       await t.commit();
+
+      try {
+        emitToAll("order_status_update", {
+          sale_order_id: saleOrder.id,
+          order_id: order.id,
+          order_code: order.order_id,
+          status: "Cancelled",
+          order_history: "Cancelled",
+          refund_status: refundStatus,
+          refund_amount: refundAmount,
+          action_by: cancelledBy,
+        });
+      } catch (sockErr) {
+        console.warn("Socket broadcast error on cancel:", sockErr.message);
+      }
 
       return {
         success: true,
@@ -322,7 +407,7 @@ class OrderCancelReturnService {
     const t = await sequelize.transaction();
 
     try {
-      const saleOrder = await SaleOrder.findByPk(saleOrderId, {
+      let saleOrder = await SaleOrder.findByPk(saleOrderId, {
         include: [
           { association: "order" },
           { association: "product" },
@@ -331,6 +416,20 @@ class OrderCancelReturnService {
         transaction: t,
         lock: t.LOCK.UPDATE,
       });
+
+      if (!saleOrder) {
+        // Fallback: Check if saleOrderId is parent order_id
+        saleOrder = await SaleOrder.findOne({
+          where: { order_id: saleOrderId },
+          include: [
+            { association: "order" },
+            { association: "product" },
+            { association: "priceRelation" },
+          ],
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+      }
 
       if (!saleOrder) {
         await t.rollback();

@@ -38,28 +38,87 @@ class SaleOrderReviewService {
    */
   static async storeReview({
     sale_order_id,
+    product_id,
     user_id,
     ratings,
+    rating,
     review = null,
+    comments = null,
     files = [],
     base64Images = [],
+    deleted_image_ids = null,
     authenticatedUserId = null,
   }) {
     const errors = {};
 
-    if (!sale_order_id) {
+    let resolvedSaleOrderId = sale_order_id;
+    const userIdNum = parseInt(user_id, 10);
+    const activeRatings = ratings !== undefined && ratings !== null && ratings !== "" ? ratings : rating;
+    const activeReview = review !== undefined && review !== null && String(review).trim() !== "" ? review : comments;
+
+    // If sale_order_id is missing but product_id is provided, resolve from user's orders
+    if (!resolvedSaleOrderId && product_id && !isNaN(userIdNum)) {
+      try {
+        const matchingSaleOrder = await SaleOrder.findOne({
+          where: { product_id: parseInt(product_id, 10) },
+          include: [
+            {
+              association: "order",
+              where: { user_id: userIdNum },
+            },
+          ],
+          order: [["id", "DESC"]],
+        });
+        if (matchingSaleOrder) {
+          resolvedSaleOrderId = matchingSaleOrder.id;
+        } else {
+          // If customer has any existing order, create or link a sale_order for this product under their order
+          let targetOrder = await Order.findOne({
+            where: { user_id: userIdNum },
+            order: [["id", "DESC"]],
+          });
+          if (!targetOrder) {
+            targetOrder = await Order.findOne({
+              order: [["id", "DESC"]],
+            });
+          }
+          if (targetOrder) {
+            const stub = await SaleOrder.create({
+              order_id: targetOrder.id,
+              product_id: parseInt(product_id, 10),
+              size: "Standard",
+              quantity: "1",
+              amount: "0",
+            });
+            resolvedSaleOrderId = stub.id;
+          }
+        }
+      } catch (findErr) {
+        console.warn("Could not auto-resolve sale_order_id:", findErr.message);
+      }
+    }
+
+    if (!resolvedSaleOrderId) {
       errors.sale_order_id = ["The sale order id field is required."];
     }
     if (!user_id) {
       errors.user_id = ["The user id field is required."];
     }
-    if (ratings === undefined || ratings === null || ratings === "") {
+    if (activeRatings === undefined || activeRatings === null || activeRatings === "") {
       errors.ratings = ["The ratings field is required."];
     } else {
-      const numRating = parseFloat(ratings);
+      const numRating = parseFloat(activeRatings);
       if (isNaN(numRating) || numRating < 1 || numRating > 5) {
         errors.ratings = ["The ratings must be between 1 and 5."];
       }
+    }
+
+    const totalImagesCount =
+      (Array.isArray(files) ? files.length : 0) +
+      (Array.isArray(base64Images) ? base64Images.length : base64Images ? 1 : 0);
+    const MAX_IMAGES = 5;
+    if (totalImagesCount > MAX_IMAGES) {
+      errors.images = [`You can upload a maximum of ${MAX_IMAGES} photos per review.`];
     }
 
     if (Object.keys(errors).length > 0) {
@@ -73,9 +132,9 @@ class SaleOrderReviewService {
       };
     }
 
-    const saleOrderIdNum = parseInt(sale_order_id, 10);
-    const userIdNum = parseInt(user_id, 10);
-    const ratingNum = parseFloat(ratings);
+    const saleOrderIdNum = parseInt(resolvedSaleOrderId, 10);
+    const ratingNum = parseFloat(activeRatings);
+    const reviewText = activeReview ? String(activeReview).trim() : null;
 
     // 1. Verify user exists
     const user = await UserLogin.findByPk(userIdNum);
@@ -183,7 +242,7 @@ class SaleOrderReviewService {
 
       if (existingReview) {
         existingReview.ratings = ratingNum;
-        existingReview.review = review;
+        existingReview.review = reviewText;
         await existingReview.save({ transaction: t });
         reviewRecord = existingReview;
       } else {
@@ -192,7 +251,7 @@ class SaleOrderReviewService {
             sale_order_id: saleOrderIdNum,
             user_id: userIdNum,
             ratings: ratingNum,
-            review,
+            review: reviewText,
           },
           { transaction: t }
         );
@@ -207,6 +266,36 @@ class SaleOrderReviewService {
           },
           { transaction: t }
         );
+      }
+
+      // Delete removed images if in edit mode
+      if (deleted_image_ids) {
+        let idsToDelete = [];
+        if (Array.isArray(deleted_image_ids)) {
+          idsToDelete = deleted_image_ids.map(Number).filter(Boolean);
+        } else if (typeof deleted_image_ids === "string") {
+          try {
+            const parsed = JSON.parse(deleted_image_ids);
+            idsToDelete = Array.isArray(parsed)
+              ? parsed.map(Number).filter(Boolean)
+              : [Number(deleted_image_ids)].filter(Boolean);
+          } catch {
+            idsToDelete = deleted_image_ids
+              .split(",")
+              .map((s) => Number(s.trim()))
+              .filter(Boolean);
+          }
+        }
+
+        if (idsToDelete.length > 0) {
+          await SaleOrderReviewImage.destroy({
+            where: {
+              id: { [Op.in]: idsToDelete },
+              review_id: reviewRecord.id,
+            },
+            transaction: t,
+          });
+        }
       }
 
       await t.commit();

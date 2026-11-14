@@ -23,6 +23,7 @@ import {
 import { buildFileUrl } from "../utils/fileUrl.js";
 import { redisClient } from "../redis/redisClient.js";
 import InventoryService from "./inventoryService.js";
+import NotificationService from "./notificationService.js";
 import PaymentService from "./paymentService.js";
 import OrderPricingService from "./orderPricingService.js";
 import OrderHistoryTimelineService from "./orderHistoryTimelineService.js";
@@ -214,14 +215,20 @@ class OrderService {
       throw new Error("No products selected for ordering.");
     }
 
-    // Resolve promo code ID
+    // Resolve promo code ID & code name
     let promoId = null;
     if (couponCode) {
+      const cleanCoupon = String(couponCode).trim();
+      const promoWhere = [{ code: cleanCoupon }];
+      if (!isNaN(Number(cleanCoupon))) {
+        promoWhere.push({ id: Number(cleanCoupon) });
+      }
       const promo = await Promocode.findOne({
-        where: { code: couponCode },
+        where: { [Op.or]: promoWhere },
       });
       if (promo) {
         promoId = promo.id;
+        couponCode = promo.code; // Normalize to promo code string for calculation
       }
     }
 
@@ -537,6 +544,9 @@ class OrderService {
           await this.cleanUpUserCart(userId, orderedPriceIds, orderedCartIds);
         }
         await this.publishVendorOrderNotification(order);
+        await NotificationService.notifyNewOrderPlaced({ order, user, isCod: true });
+      } else {
+        await NotificationService.notifyNewOrderPlaced({ order, user, isCod: false });
       }
 
       await this.publishAdminOrderNotification(order, user);
@@ -546,6 +556,9 @@ class OrderService {
         message: "Order created successfully",
         order,
         razorpay_order_id: razorpayOrderId,
+        razorpay_key_id: process.env.RAZORPAY_KEY || "rzp_test_TXqcdxL4jgko9t",
+        amount: Math.round(finalPayable * 100),
+        currency: "INR",
       };
     } catch (err) {
       await t.rollback();
@@ -602,6 +615,7 @@ class OrderService {
 
     // Notifications
     if (!wasAlreadyApproved) {
+      await NotificationService.notifyOrderPaymentConfirmed({ order });
       await this.publishVendorOrderNotification(order);
       await this.publishAdminOrderNotification(order);
     }
@@ -641,6 +655,7 @@ class OrderService {
       where: { order_id: order.id },
       include: [
         { association: "product" },
+        { association: "vendor" },
         { association: "priceRelation" },
       ],
     });
@@ -723,6 +738,7 @@ class OrderService {
           const priceIds = saleOrders.map((so) => so.price_id).filter(Boolean);
           await this.cleanUpUserCart(order.user_id, priceIds);
 
+          await NotificationService.notifyOrderPaymentConfirmed({ order });
           await this.publishVendorOrderNotification(order);
           await this.publishAdminOrderNotification(order);
         }
@@ -947,7 +963,7 @@ class OrderService {
         {
           association: "order",
           where: orderWhere,
-          attributes: ["id", "order_id", "created_at"],
+          attributes: ["id", "order_id", "created_at", "price", "payable_price", "delivery_amount", "order_history"],
         },
         {
           association: "product",
@@ -959,6 +975,10 @@ class OrderService {
         },
         {
           association: "statusHistory",
+        },
+        {
+          association: "review",
+          include: [{ association: "images" }],
         },
       ],
       order: [["id", "DESC"]],
@@ -994,59 +1014,153 @@ class OrderService {
         ? (saleOrder.material.material_name || saleOrder.material.name)
         : (saleOrder.product ? saleOrder.product.product_name : null);
 
-      // Status label and date from history
+      // Audit trail & history inspection
       const historyRecords = saleOrder.statusHistory || [];
-      const customerHistory = historyRecords.find((h) => {
-        const rawHist = h.order_history;
-        const rawStat = h.order_status;
-        return STATUS_LABELS[rawHist] || STATUS_LABELS[rawStat];
+      const sortedHistory = [...historyRecords].sort((a, b) => b.id - a.id);
+
+      // Check if delivered milestone exists in history (Customer delivery)
+      const hasDeliveredHistory = historyRecords.some((h) => {
+        const hist = String(h.order_history || "").toLowerCase().trim();
+        const stat = String(h.order_status || "").toLowerCase().trim();
+        if (
+          hist.includes("hub") ||
+          stat.includes("hub") ||
+          hist.includes("vendor") ||
+          stat.includes("vendor")
+        ) {
+          return false;
+        }
+        return hist === "delivered" || stat === "delivered" || stat === "5";
+      });
+
+      // Status resolution from saleOrder & history records (authoritative)
+      const rawStatus = saleOrder.order_history || saleOrder.order_status || "Order Placed";
+      const numericStatus = parseInt(saleOrder.order_status, 10);
+      const statusLower = String(rawStatus).toLowerCase().trim();
+      const cancelledType = String(saleOrder.cancelled_type || "").toLowerCase().trim();
+      const hasCancelledAt = Boolean(saleOrder.cancelled_at);
+
+      const isDelivered = numericStatus === 5 || statusLower === "delivered" || hasDeliveredHistory;
+
+      const hasReturn =
+        cancelledType === "return" ||
+        numericStatus === 8 ||
+        ["returned", "initiate", "return accepted", "return initiated"].includes(statusLower) ||
+        historyRecords.some((h) => {
+          const hist = String(h.order_history || "").toLowerCase().trim();
+          const stat = String(h.order_status || "").toLowerCase().trim();
+          return ["returned", "initiate", "return accepted", "return initiated", "8"].includes(stat) ||
+            ["returned", "initiate", "return accepted", "return initiated"].includes(hist);
+        });
+
+      const isCancelled =
+        !hasReturn &&
+        !isDelivered &&
+        (numericStatus === 4 ||
+          hasCancelledAt ||
+          ["cancelled", "cancel", "decline_order", "declined", "order cancelled", "4"].includes(statusLower) ||
+          statusLower.includes("cancel") ||
+          statusLower.includes("decline") ||
+          (saleOrder.order && (parseInt(saleOrder.order.order_status, 10) === 4 || ["decline_order", "cancelled", "cancel"].includes(String(saleOrder.order.order_history || "").toLowerCase().trim()))));
+
+      const hasRefundInHistory = historyRecords.some((h) => {
+        const hist = String(h.order_history || "").toLowerCase();
+        const stat = String(h.order_status || "").toLowerCase();
+        const rem = String(h.remark || "").toLowerCase();
+        return hist.includes("refund") || stat.includes("refund") || rem.includes("refund");
       });
 
       let statusLabel = "Order Placed";
       let statusDate = null;
 
-      if (customerHistory) {
-        const rawStatus = customerHistory.order_history || customerHistory.order_status;
-        statusLabel = STATUS_LABELS[rawStatus] || STATUS_LABELS[customerHistory.order_status] || "Order Placed";
-        statusDate = customerHistory.created_at
-          ? new Date(customerHistory.created_at).toISOString().split("T")[0]
-          : null;
-      } else {
-        const rawStatus = saleOrder.order_history || saleOrder.order_status;
-        statusLabel = STATUS_LABELS[rawStatus] || STATUS_LABELS[saleOrder.order_status] || "Order Placed";
-      }
-
-      // Check cancellation
-      const isCancelled =
-        saleOrder.cancelled_at !== null ||
-        parseInt(saleOrder.order_status, 10) === 4 ||
-        ["cancelled", "cancel", "decline_order", "declined", "order cancelled"].includes(
-          String(saleOrder.order_history || "").toLowerCase().trim()
-        );
-
-      if (isCancelled && !["Returned", "Product Collected", "Refund Processed"].includes(statusLabel)) {
-        statusLabel = "Cancelled";
-        if (saleOrder.cancelled_at) {
-          statusDate = new Date(saleOrder.cancelled_at).toISOString().split("T")[0];
-        }
-      }
-
-      if (!statusDate) {
-        if (saleOrder.order && saleOrder.order.created_at) {
-          statusDate = new Date(saleOrder.order.created_at).toISOString().split("T")[0];
+      if (hasReturn) {
+        statusLabel = "Returned";
+      } else if (isCancelled) {
+        if (hasRefundInHistory || statusLower.includes("refund")) {
+          statusLabel = "Refund Processed";
         } else {
-          statusDate = new Date().toISOString().split("T")[0];
+          statusLabel = "Cancelled";
         }
+      } else if (isDelivered) {
+        statusLabel = "Delivered";
+      } else if ([3, 6, 7].includes(numericStatus) || statusLower.includes("dispatch")) {
+        statusLabel = "Dispatched";
+      } else if (numericStatus === 2 || statusLower.includes("ready")) {
+        statusLabel = "Ready to Ship";
+      } else if (numericStatus === 1 || statusLower.includes("confirm") || statusLower.includes("approv")) {
+        statusLabel = "Order Confirmed";
+      } else {
+        statusLabel = STATUS_LABELS[rawStatus] || STATUS_LABELS[numericStatus] || "Order Placed";
+      }
+
+      // Latest status date from statusHistory
+      const latestHistory = sortedHistory[0] || null;
+
+      if (latestHistory && latestHistory.created_at) {
+        statusDate = new Date(latestHistory.created_at).toISOString().split("T")[0];
+      } else if (saleOrder.cancelled_at) {
+        statusDate = new Date(saleOrder.cancelled_at).toISOString().split("T")[0];
+      } else if (saleOrder.updated_at) {
+        statusDate = new Date(saleOrder.updated_at).toISOString().split("T")[0];
+      } else if (saleOrder.order && saleOrder.order.created_at) {
+        statusDate = new Date(saleOrder.order.created_at).toISOString().split("T")[0];
+      } else {
+        statusDate = new Date().toISOString().split("T")[0];
       }
 
       const orderHistoryWithDate = `${statusLabel}${statusDate ? ` - ${statusDate}` : ""}`;
 
+      let reviewData = null;
+      if (saleOrder.review) {
+        reviewData = {
+          id: saleOrder.review.id,
+          ratings: parseFloat(saleOrder.review.ratings) || 0,
+          review: saleOrder.review.review,
+          images: (saleOrder.review.images || []).map((img) => ({
+            id: img.id,
+            image_path: buildFileUrl(img.image_path),
+            url: buildFileUrl(img.image_path),
+          })),
+          created_at: saleOrder.review.created_at
+            ? new Date(saleOrder.review.created_at).toISOString().replace("T", " ").substring(0, 19)
+            : null,
+        };
+      }
+
+      const priceVal = parseFloat(saleOrder.single_product_price || 0) || parseFloat(saleOrder.amount || 0) || parseFloat(saleOrder.total_amount || 0);
+      const amountVal = parseFloat(saleOrder.amount || 0) || priceVal;
+      const totalAmountVal = parseFloat(saleOrder.total_amount || 0) || amountVal || parseFloat(saleOrder.order?.payable_price || 0) || parseFloat(saleOrder.order?.price || 0);
+
       return {
         id: saleOrder.id,
+        sale_order_id: saleOrder.id,
         sale_id: saleOrder.sale_id,
+        order_id: saleOrder.order?.order_id || saleOrder.order?.id || null,
+        product_id: saleOrder.product_id,
+        product_name: saleOrder.product?.product_name || null,
         product_image: productImage,
         product_material_name: materialName,
+        size: saleOrder.size || null,
+        quantity: parseInt(saleOrder.quantity || 1, 10),
+        amount: amountVal,
+        total_amount: totalAmountVal,
+        price: priceVal,
+        discount_price: amountVal,
+        item_price: amountVal,
+        payable_price: parseFloat(saleOrder.order?.payable_price || totalAmountVal),
+        delivery_charges: parseFloat(saleOrder.delivery_amount || saleOrder.order?.delivery_amount || 0),
+        is_customisable: saleOrder.is_customisable || "0",
+        is_customizable: String(saleOrder.is_customisable) === "1" ? 1 : 0,
+        product_type: String(saleOrder.is_customisable) === "1" ? "Customizable" : "Ready Made",
+        order_status: statusLabel,
+        status: statusLabel,
+        is_delivered: isDelivered,
+        is_returned: hasReturn,
+        is_cancelled: isCancelled,
+        cancelled_type: isCancelled || hasReturn ? (cancelledType || null) : null,
+        review: reviewData,
         order_history_with_date: orderHistoryWithDate,
+        created_at: saleOrder.created_at || saleOrder.order?.created_at || null,
       };
     });
 
@@ -1067,54 +1181,80 @@ class OrderService {
       throw new Error("Sale Order ID (sale_order_id) or Order ID (order_id) is required");
     }
 
-    const where = {};
-    if (saleOrderId) {
-      where.id = saleOrderId;
-    } else {
-      where[Op.or] = [
-        { order_id: orderId },
-        { "$order.order_id$": orderId },
-      ];
+    const sharedIncludes = [
+      {
+        association: "order",
+        include: [
+          { association: "user" },
+          { association: "address" },
+        ],
+      },
+      { association: "product" },
+      { association: "vendor" },
+      { association: "priceRelation" },
+      {
+        association: "material",
+        include: [{ association: "images" }],
+      },
+      {
+        association: "statusHistory",
+        separate: true,
+        order: [["id", "ASC"]],
+      },
+      {
+        association: "addons",
+        include: [
+          {
+            association: "productAddon",
+            include: [{ association: "addonImages" }],
+          },
+        ],
+      },
+      { association: "returnProduct" },
+      { association: "refund" },
+      {
+        association: "review",
+        include: [{ association: "images" }],
+      },
+    ];
+
+    const identifier = String(saleOrderId || orderId).trim();
+    let saleOrder = null;
+
+    // 1. Try finding by numeric primary key (sale_order_id) or order_id
+    if (/^\d+$/.test(identifier)) {
+      const numId = parseInt(identifier, 10);
+      saleOrder = await SaleOrder.findByPk(numId, { include: sharedIncludes });
+      if (!saleOrder) {
+        saleOrder = await SaleOrder.findOne({
+          where: { order_id: numId },
+          order: [["id", "DESC"]],
+          include: sharedIncludes,
+        });
+      }
     }
 
-    const saleOrder = await SaleOrder.findOne({
-      where,
-      include: [
-        {
-          association: "order",
-          include: [
-            { association: "user" },
-            { association: "address" },
-          ],
-        },
-        { association: "product" },
-        { association: "priceRelation" },
-        {
-          association: "material",
-          include: [{ association: "images" }],
-        },
-        {
-          association: "statusHistory",
-          separate: true,
-          order: [["id", "ASC"]],
-        },
-        {
-          association: "addons",
-          include: [
-            {
-              association: "productAddon",
-              include: [{ association: "addonImages" }],
-            },
-          ],
-        },
-        { association: "returnProduct" },
-        { association: "refund" },
-        {
-          association: "review",
-          include: [{ association: "images" }],
-        },
-      ],
-    });
+    // 2. Try finding by sale_id (e.g. SID933)
+    if (!saleOrder) {
+      saleOrder = await SaleOrder.findOne({
+        where: { sale_id: identifier },
+        include: sharedIncludes,
+      });
+    }
+
+    // 3. Try finding by parent order_id (e.g. ORD1116)
+    if (!saleOrder) {
+      const parentOrder = await Order.findOne({
+        where: { order_id: identifier },
+      });
+      if (parentOrder) {
+        saleOrder = await SaleOrder.findOne({
+          where: { order_id: parentOrder.id },
+          order: [["id", "DESC"]],
+          include: sharedIncludes,
+        });
+      }
+    }
 
     if (!saleOrder) {
       const error = new Error("Order details not found");
@@ -1172,7 +1312,8 @@ class OrderService {
     const priceRow = saleOrder.priceRelation;
     const actualPrice = parseFloat(priceRow?.actual_price || saleOrder.product?.actual_price || saleOrder.single_product_price || 0);
     const discountedPrice = parseFloat(saleOrder.single_product_price > 0 ? saleOrder.single_product_price : (priceRow?.discount_price || actualPrice));
-    const itemDiscount = Math.max(0, actualPrice - discountedPrice);
+    const qty = parseInt(saleOrder.quantity || 1, 10);
+    const itemDiscount = Math.max(0, actualPrice - discountedPrice) * qty;
     const couponDiscount = parseFloat(saleOrder.discount_amount || 0);
     const totalDiscount = itemDiscount + couponDiscount;
 
@@ -1181,12 +1322,12 @@ class OrderService {
       discounted_price: discountedPrice,
       discount: totalDiscount,
       item_price: discountedPrice,
-      quantity: parseInt(saleOrder.quantity || 1, 10),
+      quantity: qty,
       material_amount: parseFloat(saleOrder.material_amount || 0),
       addon_amount: parseFloat(saleOrder.addon_amount || 0),
       alter_amount: parseFloat(saleOrder.alter_amount || 0),
-      delivery_charges: 0.0,
-      total_amount: parseFloat(saleOrder.total_amount || 0),
+      delivery_charges: parseFloat(saleOrder.delivery_amount || saleOrder.order?.delivery_amount || 0),
+      total_amount: parseFloat(saleOrder.total_amount || 0) || (discountedPrice * qty - couponDiscount + parseFloat(saleOrder.addon_amount || 0) + parseFloat(saleOrder.alter_amount || 0)),
     };
 
     // 5. Build Customer Order Cycle (Timeline)
@@ -1211,8 +1352,28 @@ class OrderService {
           ["returned", "initiate", "return accepted", "return initiated"].includes(hHist);
       });
 
+    // Check if customer delivery milestone exists in status history
+    const deliveredHistory = historyRecords.find((h) => {
+      const hist = String(h.order_history || "").toLowerCase().trim();
+      const stat = String(h.order_status || "").toLowerCase().trim();
+      if (
+        hist.includes("hub") ||
+        stat.includes("hub") ||
+        hist.includes("vendor") ||
+        stat.includes("vendor") ||
+        stat.includes("returned") ||
+        hist.includes("returned")
+      ) {
+        return false;
+      }
+      return hist === "delivered" || stat === "delivered" || stat === "5";
+    });
+
+    const isDelivered = (deliveredHistory !== undefined) || numericStatus === 5 || statusLower === "delivered";
+
     const isCancelled =
       !hasReturn &&
+      !isDelivered &&
       (numericStatus === 4 ||
         ["decline_order", "cancelled", "cancel", "declined", "order cancelled", "4", "refunded"].includes(statusLower) ||
         statusLower.includes("cancel") ||
@@ -1421,7 +1582,11 @@ class OrderService {
     const review = saleOrder.review;
     if (review) {
       const reviewImages = review.images
-        ? review.images.map((img) => buildFileUrl(img.image_path)).filter(Boolean)
+        ? review.images.map((img) => ({
+            id: img.id,
+            image_path: buildFileUrl(img.image_path),
+            url: buildFileUrl(img.image_path),
+          }))
         : [];
 
       reviewData = {
@@ -1478,23 +1643,40 @@ class OrderService {
 
     // 10. Eligibility Flags
     const isCustomizable = String(saleOrder.is_customisable || "0") === "1";
-    const isDelivered = numericStatus === 5 || statusLower === "delivered";
     const deliveryDate = await OrderHistoryTimelineService.getDeliveryDate(saleOrder.id);
+    const resolvedIsDelivered = isDelivered || (deliveryDate !== null);
 
     let canReturn = false;
-    if (!isCancelled && !hasReturn) {
-      if (!isCustomizable && isDelivered && deliveryDate) {
+    if (!isCancelled && !hasReturn && resolvedIsDelivered) {
+      if (isCustomizable) {
+        canReturn = false;
+      } else if (deliveryDate) {
         const daysSinceDelivered = Math.floor((new Date().getTime() - deliveryDate.getTime()) / (1000 * 60 * 60 * 24));
         canReturn = daysSinceDelivered <= 14;
+      } else {
+        canReturn = true;
       }
     }
 
     let canCancel = true;
-    if (isCancelled || hasReturn || isDelivered) {
+    const isDispatched = await OrderHistoryTimelineService.isDispatched(saleOrder.id);
+    if (isCancelled || hasReturn || resolvedIsDelivered || isDispatched) {
       canCancel = false;
     }
 
+    // Resolve latest customer status label from history or saleOrder
     let currentStatusLabel = STATUS_LABELS[rawStatus] || STATUS_LABELS[numericStatus] || "Order Placed";
+    const latestCustomerHistory = historyRecords.slice().reverse().find((h) => {
+      const rawHist = h.order_history;
+      const rawStat = h.order_status;
+      return STATUS_LABELS[rawHist] || STATUS_LABELS[rawStat] || STATUS_LABELS[String(rawHist).toLowerCase().trim()] || STATUS_LABELS[String(rawStat).toLowerCase().trim()];
+    });
+
+    if (latestCustomerHistory) {
+      const histStatus = latestCustomerHistory.order_history || latestCustomerHistory.order_status;
+      currentStatusLabel = STATUS_LABELS[histStatus] || STATUS_LABELS[latestCustomerHistory.order_status] || STATUS_LABELS[String(histStatus).toLowerCase().trim()] || currentStatusLabel;
+    }
+
     if (isCancelled && !["Refund Processed", "Returned", "Product Collected"].includes(currentStatusLabel)) {
       currentStatusLabel = "Cancelled";
     }
@@ -1512,6 +1694,8 @@ class OrderService {
         size: saleOrder.size,
         quantity: parseInt(saleOrder.quantity || 1, 10),
         is_customisable: saleOrder.is_customisable || "0",
+        is_customizable: isCustomizable ? 1 : 0,
+        product_type: isCustomizable ? "Customizable" : "Ready Made",
         is_alter: saleOrder.is_alter || "0",
         alter_amount: parseFloat(saleOrder.alter_amount || 0),
         measurment_details: formattedMeasurements,
@@ -1520,14 +1704,72 @@ class OrderService {
         addons_count: formattedAddons.length,
         addon_amount: parseFloat(saleOrder.addon_amount || 0),
         formatted_addon_amount: `₹${parseFloat(saleOrder.addon_amount || 0).toFixed(2)}`,
+        order_status: currentStatusLabel,
+        status: currentStatusLabel,
+        order_history: saleOrder.order_history,
+        is_cancelled: isCancelled,
+        is_returned: hasReturn,
+        is_delivered: resolvedIsDelivered,
+        cancelled_type: cancelledType || null,
         current_status: currentStatusLabel,
         current_status_label: currentStatusLabel,
         cancelled_at: saleOrder.cancelled_at ? new Date(saleOrder.cancelled_at).toISOString().replace("T", " ").substring(0, 19) : null,
         cancel_remark: saleOrder.cancel_remark || null,
+        cancel: canCancel,
+        cancel_status: canCancel,
+        return: canReturn,
+        return_status: canReturn,
+        refund: refundRecord ? {
+          id: refundRecord.id,
+          refund_id: refundRecord.id,
+          amount: parseFloat(refundRecord.amount || 0),
+          refund_status: refundRecord.refund_status,
+          transaction_id: refundRecord.transaction_id,
+          reason: refundRecord.reason,
+          created_at: refundRecord.created_at,
+        } : null,
         order_cycle: orderCycle,
         return_details: returnDetails,
         deliveried_address: deliveredAddress,
         price_details: priceDetails,
+        amount: parseFloat(saleOrder.amount || saleOrder.total_amount || priceDetails.item_price || 0),
+        total_amount: parseFloat(saleOrder.total_amount || priceDetails.total_amount || 0),
+        price: parseFloat(priceDetails.discounted_price || priceDetails.item_price || saleOrder.amount || 0),
+        item_price: parseFloat(priceDetails.item_price || saleOrder.amount || 0),
+        discount_price: parseFloat(priceDetails.discounted_price || saleOrder.amount || 0),
+        actual_price: parseFloat(priceDetails.actual_price || 0),
+        delivery_charges: parseFloat(priceDetails.delivery_charges || saleOrder.delivery_amount || 0),
+        delivery_amount: parseFloat(saleOrder.delivery_amount || priceDetails.delivery_charges || 0),
+        items: [
+          {
+            id: saleOrder.id,
+            sale_order_id: saleOrder.id,
+            product_id: saleOrder.product_id,
+            product_name: productName,
+            product_image: productImage,
+            material_name: materialName,
+            size: saleOrder.size,
+            quantity: parseInt(saleOrder.quantity || 1, 10),
+            price: parseFloat(priceDetails.discounted_price || priceDetails.item_price || saleOrder.amount || 0),
+            discount_price: parseFloat(priceDetails.discounted_price || saleOrder.amount || 0),
+            item_price: parseFloat(priceDetails.item_price || saleOrder.amount || 0),
+            total_amount: parseFloat(saleOrder.total_amount || priceDetails.total_amount || 0),
+            amount: parseFloat(saleOrder.amount || 0),
+            is_customisable: saleOrder.is_customisable || "0",
+            product_type: isCustomizable ? "Customizable" : "Ready Made",
+            measurements: formattedMeasurements,
+            measurment_details: formattedMeasurements,
+            review: reviewData,
+          },
+        ],
+        vendor_id: saleOrder.vendor_id ? parseInt(saleOrder.vendor_id, 10) : null,
+        vendor: saleOrder.vendor ? {
+          id: saleOrder.vendor.id,
+          name: saleOrder.vendor.shop_name || saleOrder.vendor.brand_business_name || saleOrder.vendor.seller_name || "Bespoke Vendor",
+          shop_name: saleOrder.vendor.shop_name || "Bespoke Support",
+          seller_name: saleOrder.vendor.seller_name || null,
+          image: saleOrder.vendor.img_path ? buildFileUrl(saleOrder.vendor.img_path) : null,
+        } : null,
         review: reviewData,
         return: canReturn,
         return_status: canReturn,

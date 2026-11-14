@@ -62,10 +62,9 @@ export const getSubcategoriesList = async (req, res) => {
   } catch (error) {
     console.error("❌ [HomepageController::getSubcategoriesList] error:", error);
     return res.status(500).json({
-      status: false,
+      status: "false",
       message: error.message || "Failed to retrieve subcategories",
       data: [],
-      pagination: { current_page: 1, per_page: 10, total: 0, last_page: 1 },
     });
   }
 };

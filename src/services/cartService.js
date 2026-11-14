@@ -299,7 +299,7 @@ export async function getUserCart(userId) {
         actual_price: priceData.actual_price,
         offer_price: priceData.discount_price,
 
-        is_out_of_stock: priceData.is_out_stock === "1" || priceData.qty <= 0,
+        is_out_of_stock: String(priceData.is_out_stock) === "1",
         is_customizable: Boolean(product.is_customizable),
 
         category: product.categoryRel?.name || null,

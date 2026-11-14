@@ -2,6 +2,7 @@ import { Op } from "sequelize";
 import sequelize from "../../config/db.js";
 import {
   Product,
+  ProductFabric,
   ProductMaterial,
   ProductPrice,
   ProductImage,
@@ -231,18 +232,12 @@ export async function getVendorProducts(params, reqUrl = "/api/product/list") {
   }
 
   // Material eligibility filter:
-  // If product has materials, only include if at least one material is active (action = 0 or null, is_active = 1)
-  const productsWithAnyMaterial = await ProductMaterial.findAll({
-    attributes: [sequelize.fn("DISTINCT", sequelize.col("product_id")), "product_id"],
-    raw: true,
-  });
-  const allProductIdsWithMaterials = productsWithAnyMaterial.map((m) => m.product_id);
-
+  // Strictly require at least one active material in product_materials (is_active = '1', action = '0' or null)
   const activeMaterialProducts = await ProductMaterial.findAll({
     where: {
       [Op.and]: [
         { [Op.or]: [{ action: "0" }, { action: null }] },
-        { [Op.or]: [{ is_active: "1" }, { is_active: 1 }] },
+        { is_active: "1" },
       ],
     },
     attributes: [sequelize.fn("DISTINCT", sequelize.col("product_id")), "product_id"],
@@ -250,15 +245,10 @@ export async function getVendorProducts(params, reqUrl = "/api/product/list") {
   });
   const productIdsWithActiveMaterials = activeMaterialProducts.map((m) => m.product_id);
 
-  // Exclude products that HAVE materials but NONE of their materials are active
-  const productsWithInactiveMaterialsOnly = allProductIdsWithMaterials.filter(
-    (id) => !productIdsWithActiveMaterials.includes(id)
-  );
-  if (productsWithInactiveMaterialsOnly.length > 0) {
-    whereConditions[Op.and].push({
-      id: { [Op.notIn]: productsWithInactiveMaterialsOnly },
-    });
-  }
+  // Require product to have active materials
+  whereConditions[Op.and].push({
+    id: { [Op.in]: productIdsWithActiveMaterials },
+  });
 
   // Count total matching products
   const total = await Product.count({ where: whereConditions });
@@ -283,10 +273,10 @@ export async function getVendorProducts(params, reqUrl = "/api/product/list") {
         where: {
           [Op.and]: [
             { [Op.or]: [{ action: "0" }, { action: null }] },
-            { [Op.or]: [{ is_active: "1" }, { is_active: 1 }] },
+            { is_active: "1" },
           ],
         },
-        required: false,
+        required: true,
         include: [
           {
             model: ProductMaterialImage,
@@ -497,6 +487,14 @@ export async function getProductDetails(productId, userId = null) {
         ],
       },
       {
+        model: ProductFabric,
+        as: "fabrics",
+        where: {
+          [Op.or]: [{ action: "0" }, { action: null }],
+        },
+        required: false,
+      },
+      {
         model: ProductInfo,
         as: "productInfo",
         where: {
@@ -508,7 +506,10 @@ export async function getProductDetails(productId, userId = null) {
         model: ProductMaterial,
         as: "productMaterials",
         where: {
-          [Op.or]: [{ action: "0" }, { action: null }],
+          [Op.and]: [
+            { [Op.or]: [{ action: "0" }, { action: null }] },
+            { is_active: "1" },
+          ],
         },
         required: false,
         include: [
@@ -1076,7 +1077,65 @@ export async function getProductDetails(productId, userId = null) {
   delete productJson.productInfo;
 
   productJson.product_materials = productJson.productMaterials || [];
+  productJson.materials = productJson.product_materials;
   delete productJson.productMaterials;
+
+  // Assemble nested fabrics and colours
+  const rawFabrics = productJson.fabrics || [];
+  const matsList = productJson.product_materials || [];
+
+  if (rawFabrics.length > 0) {
+    productJson.fabrics = rawFabrics.map((fab) => {
+      const coloursForFab = matsList.filter((m) => {
+        if (m.product_fabric_id && Number(m.product_fabric_id) === Number(fab.id)) return true;
+        if (m.name && fab.fabric_name && m.name.trim().toLowerCase() === fab.fabric_name.trim().toLowerCase()) return true;
+        return false;
+      });
+      return {
+        id: fab.id,
+        fabric_name: fab.fabric_name,
+        name: fab.fabric_name,
+        composition: fab.composition || "",
+        description: fab.description || "",
+        colours: coloursForFab.map((c) => ({
+          ...c,
+          colour_name: c.material_name || c.name,
+          color_code: c.color_code || "#000000",
+          identity: c.material_name || c.name,
+          fabric_name: fab.fabric_name,
+        })),
+        materials: coloursForFab,
+      };
+    });
+  } else if (matsList.length > 0) {
+    // Legacy products fallback: Group materials by fabric name
+    const grouped = {};
+    matsList.forEach((m) => {
+      const fName = m.name || "Default Fabric";
+      if (!grouped[fName]) {
+        grouped[fName] = {
+          id: m.product_fabric_id || 1,
+          fabric_name: fName,
+          name: fName,
+          composition: "",
+          description: m.description || "",
+          colours: [],
+          materials: [],
+        };
+      }
+      const cObj = {
+        ...m,
+        colour_name: m.material_name || m.name,
+        color_code: m.color_code || "#000000",
+        identity: m.material_name || m.name,
+      };
+      grouped[fName].colours.push(cObj);
+      grouped[fName].materials.push(m);
+    });
+    productJson.fabrics = Object.values(grouped);
+  } else {
+    productJson.fabrics = [];
+  }
 
   // PHP implementation hides product_measurements and addons from the top-level serialized response
   delete productJson.product_measurements;
@@ -1100,9 +1159,8 @@ export async function getProductMeasurementSizeWise(productIdParam) {
     };
   }
 
-  const productId = parseInt(productIdParam, 10);
-
-  const product = await Product.findByPk(productId, {
+  let resolvedProductId = parseInt(productIdParam, 10);
+  let product = await Product.findByPk(resolvedProductId, {
     include: [
       { model: Category, as: "categoryRel", attributes: ["id", "name"] },
       { model: Subcategory, as: "subcategoryRel", attributes: ["id", "name"] },
@@ -1115,6 +1173,25 @@ export async function getProductMeasurementSizeWise(productIdParam) {
   });
 
   if (!product) {
+    // Fallback: check if the param is a product_price ID
+    const priceRecord = await ProductPrice.findByPk(resolvedProductId);
+    if (priceRecord && priceRecord.product_id) {
+      resolvedProductId = priceRecord.product_id;
+      product = await Product.findByPk(resolvedProductId, {
+        include: [
+          { model: Category, as: "categoryRel", attributes: ["id", "name"] },
+          { model: Subcategory, as: "subcategoryRel", attributes: ["id", "name"] },
+          {
+            model: ProductMaterial,
+            as: "productMaterials",
+            include: [{ model: ProductMaterialImage, as: "images" }],
+          },
+        ],
+      });
+    }
+  }
+
+  if (!product) {
     return {
       success: false,
       statusCode: 404,
@@ -1125,7 +1202,7 @@ export async function getProductMeasurementSizeWise(productIdParam) {
   // 1. Gather all product measurements from product_measurements table
   const productMeasurements = await ProductMeasurement.findAll({
     where: {
-      product_id: productId,
+      product_id: resolvedProductId,
       [Op.or]: [{ action: false }, { action: null }],
     },
     include: [{ model: Measurement, as: "measurement" }],
@@ -1134,7 +1211,7 @@ export async function getProductMeasurementSizeWise(productIdParam) {
   // 2. Also check product_size_details table (ProductSize)
   const productSizes = await ProductSize.findAll({
     where: {
-      product_id: productId,
+      product_id: resolvedProductId,
       [Op.or]: [{ action: false }, { action: null }],
     },
     include: [{ model: Measurement, as: "measurement" }],
@@ -1144,7 +1221,7 @@ export async function getProductMeasurementSizeWise(productIdParam) {
   const distinctSizes = [];
 
   // From product_prices
-  const prices = await ProductPrice.findAll({ where: { product_id: productId } });
+  const prices = await ProductPrice.findAll({ where: { product_id: resolvedProductId } });
   for (const p of prices) {
     const rawSize = p.size;
     if (rawSize && !["0", "null"].includes(String(rawSize).toLowerCase())) {

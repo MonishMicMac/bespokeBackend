@@ -256,9 +256,20 @@ export async function getShopProductList(params) {
   const whereProduct = {
     vendor_id: String(shopId),
     action: "0",
+    is_active: "1",
   };
 
-  const total = await Product.count({ where: whereProduct });
+  const total = await Product.count({
+    where: whereProduct,
+    include: [
+      {
+        model: ProductMaterial,
+        as: "productMaterials",
+        where: { action: "0", is_active: "1" },
+        required: true,
+      },
+    ],
+  });
   const lastPage = Math.max(1, Math.ceil(total / perPage));
 
   const products = await Product.findAll({
@@ -275,8 +286,8 @@ export async function getShopProductList(params) {
       {
         model: ProductMaterial,
         as: "productMaterials",
-        where: { action: "0" },
-        required: false,
+        where: { action: "0", is_active: "1" },
+        required: true,
         include: [
           {
             model: ProductMaterialImage,
@@ -587,19 +598,35 @@ export async function getDesignerProductList(params) {
   const whereProduct = {
     vendor_id: resolvedVendorId,
     action: "0",
+    is_active: "1",
   };
 
-  let total = await Product.count({ where: whereProduct });
+  let total = await Product.count({
+    where: whereProduct,
+    include: [
+      {
+        model: ProductMaterial,
+        as: "productMaterials",
+        where: { action: "0", is_active: "1" },
+        required: true,
+      },
+    ],
+  });
   let products = await Product.findAll({
     where: whereProduct,
     include: [
       { model: Category, as: "categoryRel", attributes: ["name"] },
       { model: Subcategory, as: "subcategoryRel", attributes: ["name"] },
       {
+        model: ProductPrice,
+        as: "prices",
+        required: false,
+      },
+      {
         model: ProductMaterial,
         as: "productMaterials",
-        where: { action: "0" },
-        required: false,
+        where: { action: "0", is_active: "1" },
+        required: true,
         include: [
           {
             model: ProductMaterialImage,
@@ -614,34 +641,6 @@ export async function getDesignerProductList(params) {
     limit: perPage,
     offset: offset,
   });
-
-  if (products.length === 0) {
-    total = await Product.count({ where: { action: "0", is_active: "1" } });
-    products = await Product.findAll({
-      where: { action: "0", is_active: "1" },
-      include: [
-        { model: Category, as: "categoryRel", attributes: ["name"] },
-        { model: Subcategory, as: "subcategoryRel", attributes: ["name"] },
-        {
-          model: ProductMaterial,
-          as: "productMaterials",
-          where: { action: "0" },
-          required: false,
-          include: [
-            {
-              model: ProductMaterialImage,
-              as: "images",
-              where: { action: false },
-              required: false,
-            },
-          ],
-        },
-      ],
-      order: [["id", "DESC"]],
-      limit: perPage,
-      offset: offset,
-    });
-  }
 
   const lastPage = Math.max(1, Math.ceil(total / perPage));
 
@@ -680,6 +679,25 @@ export async function getDesignerProductList(params) {
       }
       prod.main_image = imageUrl;
       delete prod.productMaterials;
+
+      if (prod.prices && prod.prices.length > 0) {
+        const p0 = prod.prices[0];
+        const actual = parseFloat(p0.actual_price) || 0;
+        const disc = parseFloat(p0.discount_price) || actual;
+        prod.price = disc || actual || 499;
+        prod.actual_price = actual || prod.price;
+        prod.discount_price = disc || prod.price;
+        prod.discount_percentage = actual > disc && actual > 0
+          ? Math.round(((actual - disc) / actual) * 100)
+          : 0;
+        prod.price_id = p0.id;
+      } else {
+        prod.price = 499;
+        prod.actual_price = 499;
+        prod.discount_price = 499;
+        prod.discount_percentage = 0;
+      }
+      delete prod.prices;
 
       // Bestseller check
       const isBestseller = await SaleOrder.findOne({

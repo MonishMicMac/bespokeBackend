@@ -1,4 +1,5 @@
 import Product from "./Product.js";
+import ProductFabric from "./ProductFabric.js";
 import ProductMaterial from "./ProductMaterial.js";
 import ProductPrice from "./ProductPrice.js";
 import ProductImage from "./ProductImage.js";
@@ -41,6 +42,9 @@ import Refund from "./Refund.js";
 import ReturnProduct from "./ReturnProduct.js";
 import SaleOrderShipment from "./SaleOrderShipment.js";
 import OrderAddon from "./OrderAddon.js";
+import Invoice from "./Invoice.js";
+import InvoiceItem from "./InvoiceItem.js";
+import InvoiceAdjustment from "./InvoiceAdjustment.js";
 
 let associationsInitialized = false;
 
@@ -53,6 +57,7 @@ export function initProductAssociations() {
   Product.belongsTo(Category, { foreignKey: "category", as: "categoryRel" });
   Product.belongsTo(Subcategory, { foreignKey: "subcategory", as: "subcategoryRel" });
   Product.hasMany(ProductInfo, { foreignKey: "product_id", as: "productInfo" });
+  Product.hasMany(ProductFabric, { foreignKey: "product_id", as: "fabrics" });
   Product.hasMany(ProductPrice, { foreignKey: "product_id", as: "prices" });
   Product.hasMany(ProductMaterial, { foreignKey: "product_id", as: "productMaterials" });
   Product.hasMany(ProductImage, { foreignKey: "product_id", as: "images" });
@@ -62,8 +67,14 @@ export function initProductAssociations() {
   Product.hasMany(ProductAddon, { foreignKey: "product_id", as: "addons" });
   Product.hasOne(ProductReviewAggregate, { foreignKey: "product_id", as: "reviewAggregate" });
 
+  // ProductFabric relationships
+  ProductFabric.belongsTo(Product, { foreignKey: "product_id", as: "product" });
+  ProductFabric.hasMany(ProductMaterial, { foreignKey: "product_fabric_id", as: "colours" });
+  ProductFabric.hasMany(ProductMaterial, { foreignKey: "product_fabric_id", as: "materials" });
+
   // ProductMaterial relationships
   ProductMaterial.belongsTo(Product, { foreignKey: "product_id", as: "product" });
+  ProductMaterial.belongsTo(ProductFabric, { foreignKey: "product_fabric_id", as: "fabric" });
   ProductMaterial.hasMany(ProductMaterialImage, { foreignKey: "product_material_id", as: "images" });
   ProductMaterial.hasMany(ProductPrice, { foreignKey: "material_id", as: "prices" });
   ProductMaterial.hasMany(ProductAddon, { foreignKey: "material_id", as: "addons" });
@@ -186,12 +197,29 @@ export function initProductAssociations() {
   // Promocode & Order relationships (orders.coupen_id -> promo_codes.id)
   Order.belongsTo(Promocode, { foreignKey: "coupen_id", as: "promocode" });
   Promocode.hasMany(Order, { foreignKey: "coupen_id", as: "orders" });
+
+  // Invoice relationships
+  Order.hasMany(Invoice, { foreignKey: "order_id", as: "invoices" });
+  Invoice.belongsTo(Order, { foreignKey: "order_id", as: "order" });
+
+  Invoice.hasMany(InvoiceItem, { foreignKey: "invoice_id", as: "items" });
+  InvoiceItem.belongsTo(Invoice, { foreignKey: "invoice_id", as: "invoice" });
+
+  Invoice.hasMany(InvoiceAdjustment, { foreignKey: "invoice_id", as: "adjustments" });
+  InvoiceAdjustment.belongsTo(Invoice, { foreignKey: "invoice_id", as: "invoice" });
+
+  SaleOrder.hasMany(InvoiceItem, { foreignKey: "sale_order_id", as: "invoiceItems" });
+  InvoiceItem.belongsTo(SaleOrder, { foreignKey: "sale_order_id", as: "saleOrder" });
+
+  VendorLogin.hasMany(Invoice, { foreignKey: "seller_id", as: "invoices" });
+  Invoice.belongsTo(VendorLogin, { foreignKey: "seller_id", as: "vendor" });
 }
 
 initProductAssociations();
 
 export {
   Product,
+  ProductFabric,
   ProductMaterial,
   ProductPrice,
   ProductImage,
@@ -236,4 +264,7 @@ export {
   ReturnProduct,
   SaleOrderShipment,
   OrderAddon,
+  Invoice,
+  InvoiceItem,
+  InvoiceAdjustment,
 };

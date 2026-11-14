@@ -220,6 +220,9 @@ export async function applyPromoCode({
     discount,
     error: null,
     promo_id: promo.id,
+    promo_type: promo.type,
+    promo_value: promoVal,
+    promo_code: promo.code,
   };
 }
 

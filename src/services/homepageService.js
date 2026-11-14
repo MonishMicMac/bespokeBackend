@@ -124,24 +124,105 @@ function formatSqlDate(dateVal) {
   return d.toISOString().slice(0, 19).replace("T", " ");
 }
 
+const KNOWN_CATEGORIES_META = {
+  3: { id: 3, name: "Indian & Fusion Wear", type: "2" },
+  8: { id: 8, name: "Inner Wear & Sleepwear", type: "1" },
+  9: { id: 9, name: "Bottom Wear", type: "1" },
+  11: { id: 11, name: "Indian & Festival Wear", type: "1" },
+  14: { id: 14, name: "Western Wear", type: "2" },
+  18: { id: 18, name: "Girls Clothing", type: "3" },
+  19: { id: 19, name: "Boys Clothing", type: "3" },
+  24: { id: 24, name: "Top Wear", type: "1" },
+  34: { id: 34, name: "Bottom Wear", type: "1" },
+  35: { id: 35, name: "Innerwear & Sleepwear", type: "1" },
+  36: { id: 36, name: "Footwear", type: "1" },
+  44: { id: 44, name: "Mens", type: "1" },
+  45: { id: 45, name: "Boys Clothing", type: "3" },
+  46: { id: 46, name: "Girls Clothing", type: "3" },
+  47: { id: 47, name: "Wear Top Wear", type: "2" },
+  48: { id: 48, name: "Indian & Fusion Wear", type: "2" },
+  49: { id: 49, name: "Traditional & Sarees", type: "2" },
+  50: { id: 50, name: "Cups & Lifestyle", type: "0" },
+  51: { id: 51, name: "Unisex Streetwear", type: "4" },
+  52: { id: 52, name: "Suits & Tailoring", type: "1" },
+  53: { id: 53, name: "Co-ords & Sets", type: "2" },
+  54: { id: 54, name: "Dresses", type: "3" },
+};
+
 /**
  * RESTful Categories List (Matching Laravel GET /api/categories)
  * GET /api/categories
  */
 export async function getCategoriesPaginated(queryParams = {}) {
+  const isPaginated = Boolean(queryParams.page || queryParams.per_page);
   const page = Math.max(1, parseInt(queryParams.page || 1, 10));
   const perPage = Math.max(1, parseInt(queryParams.per_page || 10, 10));
   const offset = (page - 1) * perPage;
 
-  const { count, rows } = await Category.findAndCountAll({
+  const findOptions = {
     where: { action: "0" },
     order: [["id", "DESC"]],
-    limit: perPage,
-    offset,
+  };
+
+  if (isPaginated) {
+    findOptions.limit = perPage;
+    findOptions.offset = offset;
+  }
+
+  const { count, rows } = await Category.findAndCountAll(findOptions);
+
+  // Also query subcategories to attach to each category
+  const allSubcategories = await Subcategory.findAll({
+    where: { action: "0" },
+    order: [["id", "ASC"]],
   });
+
+  const subcatByCatId = {};
+  for (const sub of allSubcategories) {
+    const s = sub.toJSON();
+    const fullImg = buildFileUrl(s.img_path);
+    s.img_path = fullImg;
+    s.image = fullImg;
+    s.image_url = fullImg;
+    s.cover_image = fullImg;
+    s.created_at = formatLaravelTimestamp(s.created_at);
+    s.updated_at = formatLaravelTimestamp(s.updated_at);
+
+    const cid = String(s.category_id);
+    if (!subcatByCatId[cid]) subcatByCatId[cid] = [];
+    subcatByCatId[cid].push(s);
+
+    // Also map legacy category IDs to modern category IDs
+    // 3 -> 48 (Indian & Fusion Wear)
+    if (cid === "3") {
+      if (!subcatByCatId["48"]) subcatByCatId["48"] = [];
+      subcatByCatId["48"].push(s);
+    }
+    // 14 -> 54 (Dresses & Western Wear)
+    if (cid === "14") {
+      if (!subcatByCatId["54"]) subcatByCatId["54"] = [];
+      subcatByCatId["54"].push(s);
+    }
+    // 24 -> 44 (Top Wear / Mens)
+    if (cid === "24") {
+      if (!subcatByCatId["44"]) subcatByCatId["44"] = [];
+      subcatByCatId["44"].push(s);
+    }
+    // 19 -> 45 (Boys Clothing)
+    if (cid === "19") {
+      if (!subcatByCatId["45"]) subcatByCatId["45"] = [];
+      subcatByCatId["45"].push(s);
+    }
+    // 18 -> 46 (Girls Clothing)
+    if (cid === "18") {
+      if (!subcatByCatId["46"]) subcatByCatId["46"] = [];
+      subcatByCatId["46"].push(s);
+    }
+  }
 
   const formatted = rows.map((c) => {
     const fullImg = buildFileUrl(c.img_path);
+    const catSubs = subcatByCatId[String(c.id)] || [];
     return {
       id: Number(c.id),
       type: String(c.type ?? ""),
@@ -156,24 +237,30 @@ export async function getCategoriesPaginated(queryParams = {}) {
       cover_image: fullImg,
       category_name: c.name,
       category_type: String(c.type ?? ""),
+      subcategories: catSubs,
     };
   });
 
-  const total = count;
-  const lastPage = Math.ceil(total / perPage) || 1;
+  const response = {
+    status: "true",
+    data: formatted,
+    categories: formatted,
+  };
+
+  if (isPaginated) {
+    const total = count;
+    const lastPage = Math.ceil(total / perPage) || 1;
+    response.pagination = {
+      current_page: page,
+      per_page: perPage,
+      total: total,
+      last_page: lastPage,
+    };
+  }
 
   return {
     statusCode: 200,
-    response: {
-      status: "true",
-      data: formatted,
-      pagination: {
-        current_page: page,
-        per_page: perPage,
-        total: total,
-        last_page: lastPage,
-      },
-    },
+    response,
   };
 }
 
@@ -182,6 +269,7 @@ export async function getCategoriesPaginated(queryParams = {}) {
  * GET /api/subcategories
  */
 export async function getSubcategoriesPaginated(queryParams = {}) {
+  const isPaginated = Boolean(queryParams.page || queryParams.per_page);
   const page = Math.max(1, parseInt(queryParams.page || 1, 10));
   const perPage = Math.max(1, parseInt(queryParams.per_page || 10, 10));
   const offset = (page - 1) * perPage;
@@ -191,12 +279,17 @@ export async function getSubcategoriesPaginated(queryParams = {}) {
     where.category_id = Number(queryParams.category_id || queryParams.category);
   }
 
-  const { count, rows } = await Subcategory.findAndCountAll({
+  const findOptions = {
     where,
-    order: [["id", "DESC"]],
-    limit: perPage,
-    offset,
-  });
+    order: [["id", "ASC"]],
+  };
+
+  if (isPaginated) {
+    findOptions.limit = perPage;
+    findOptions.offset = offset;
+  }
+
+  const { count, rows } = await Subcategory.findAndCountAll(findOptions);
 
   const catIds = [...new Set(rows.map((s) => s.category_id).filter(Boolean))];
   const categories =
@@ -221,12 +314,31 @@ export async function getSubcategoriesPaginated(queryParams = {}) {
     };
   }
 
+  // Enrich with KNOWN_CATEGORIES_META for legacy category IDs (e.g. 3, 14, 24, 11, 9, 8, 19, 18)
+  for (const cid of catIds) {
+    if (!catMap[cid] && KNOWN_CATEGORIES_META[cid]) {
+      const meta = KNOWN_CATEGORIES_META[cid];
+      catMap[cid] = {
+        id: Number(meta.id),
+        type: String(meta.type),
+        name: meta.name,
+        img_path: null,
+        action: "0",
+        c_date: null,
+        created_at: null,
+        updated_at: null,
+      };
+    }
+  }
+
   const formatted = rows.map((s) => {
     const fullImg = buildFileUrl(s.img_path);
+    const parentCat = catMap[s.category_id] || KNOWN_CATEGORIES_META[s.category_id] || null;
+    const resolvedCatType = String(s.category_type || parentCat?.type || "");
     return {
       id: Number(s.id),
       name: s.name,
-      category_type: String(s.category_type ?? ""),
+      category_type: resolvedCatType,
       category_id: Number(s.category_id),
       img_path: fullImg,
       action: String(s.action ?? "0"),
@@ -235,26 +347,42 @@ export async function getSubcategoriesPaginated(queryParams = {}) {
       image_url: fullImg,
       image: fullImg,
       cover_image: fullImg,
-      category: catMap[s.category_id] || null,
+      category: parentCat
+        ? {
+            id: Number(parentCat.id),
+            type: String(parentCat.type ?? ""),
+            name: parentCat.name,
+            img_path: parentCat.img_path || fullImg,
+            action: String(parentCat.action ?? "0"),
+            c_date: parentCat.c_date || null,
+            created_at: parentCat.created_at || null,
+            updated_at: parentCat.updated_at || null,
+          }
+        : null,
       measurements: [],
     };
   });
 
-  const total = count;
-  const lastPage = Math.ceil(total / perPage) || 1;
+  const response = {
+    status: "true",
+    message: "Data retrieved successfully.",
+    data: formatted,
+  };
+
+  if (isPaginated) {
+    const total = count;
+    const lastPage = Math.ceil(total / perPage) || 1;
+    response.pagination = {
+      current_page: page,
+      per_page: perPage,
+      total: total,
+      last_page: lastPage,
+    };
+  }
 
   return {
     statusCode: 200,
-    response: {
-      status: true,
-      data: formatted,
-      pagination: {
-        current_page: page,
-        per_page: perPage,
-        total: total,
-        last_page: lastPage,
-      },
-    },
+    response,
   };
 }
 
@@ -569,8 +697,12 @@ export async function getCurrentDealsView(userId) {
   const query = `
     SELECT
       cd.id,
-      cd.name,
+      cd.name AS deal_name,
       cd.product_id,
+      p.vendor_id,
+      vl.shop_name AS vendor_shop_name,
+      vl.seller_name AS vendor_seller_name,
+      vl.brand_business_name AS vendor_brand_name,
       p.product_name,
       p.main_image,
       c.name AS category,
@@ -578,6 +710,7 @@ export async function getCurrentDealsView(userId) {
       pp.actual_price
     FROM current_deals cd
     LEFT JOIN products p ON (cd.product_id = p.id OR cd.product_id = p.product_id)
+    LEFT JOIN vendor_login vl ON p.vendor_id = vl.id
     LEFT JOIN categories c ON p.category = c.id
     LEFT JOIN subcategories sc ON p.subcategory = sc.id
     LEFT JOIN product_prices pp ON pp.id = (
@@ -588,6 +721,13 @@ export async function getCurrentDealsView(userId) {
     WHERE cd.action = '0'
       AND cd.product_id IS NOT NULL
       AND cd.product_id != ''
+      AND p.id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM product_materials pm
+        WHERE pm.product_id = p.id
+          AND pm.is_active = '1'
+          AND (pm.action IS NULL OR pm.action = '0' OR pm.action != '1')
+      )
     ORDER BY cd.id DESC
   `;
 
@@ -645,9 +785,27 @@ export async function getCurrentDealsView(userId) {
     const materialImgPath = materialImagesMap[pid] || deal.main_image || null;
     const resolvedImage = buildFileUrl(materialImgPath);
 
+    const canonicalVendorName =
+      deal.vendor_shop_name ||
+      deal.vendor_brand_name ||
+      deal.vendor_seller_name ||
+      deal.deal_name ||
+      "Bespoke Studio";
+
     return {
       id: deal.id,
-      name: deal.name,
+      deal_name: deal.deal_name,
+      name: canonicalVendorName,
+      vendor_name: canonicalVendorName,
+      vendor_id: deal.vendor_id ? Number(deal.vendor_id) : null,
+      vendor: deal.vendor_id
+        ? {
+            id: Number(deal.vendor_id),
+            shop_name: deal.vendor_shop_name || canonicalVendorName,
+            seller_name: deal.vendor_seller_name || null,
+            brand_business_name: deal.vendor_brand_name || null,
+          }
+        : null,
       product_id: deal.product_id,
       product_name: deal.product_name,
       main_image: resolvedImage,
@@ -677,16 +835,28 @@ export async function getSuperSaveDealsView(userId) {
   const query = `
     SELECT
       ssd.id,
-      ssd.name,
+      ssd.name AS deal_name,
       ssd.product_id,
       ssd.title,
       ssd.price,
       ssd.brand_logo,
+      p.vendor_id,
+      vl.shop_name AS vendor_shop_name,
+      vl.seller_name AS vendor_seller_name,
+      vl.brand_business_name AS vendor_brand_name,
       p.product_name,
       p.main_image
     FROM super_save_deals ssd
     LEFT JOIN products p ON (ssd.product_id = p.id OR ssd.product_id = p.product_id)
+    LEFT JOIN vendor_login vl ON p.vendor_id = vl.id
     WHERE ssd.action = '0'
+      AND p.id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM product_materials pm
+        WHERE pm.product_id = p.id
+          AND pm.is_active = '1'
+          AND (pm.action IS NULL OR pm.action = '0' OR pm.action != '1')
+      )
     ORDER BY ssd.id DESC
   `;
 
@@ -729,7 +899,25 @@ export async function getSuperSaveDealsView(userId) {
 
   // Fetch active products for fallback if a deal references an orphaned product ID
   const activeProducts = await sequelize.query(
-    "SELECT id, product_name, main_image FROM products WHERE action = '0' AND is_active = '1' ORDER BY id DESC LIMIT 10",
+    `SELECT
+       p.id,
+       p.product_name,
+       p.main_image,
+       p.vendor_id,
+       vl.shop_name AS vendor_shop_name,
+       vl.seller_name AS vendor_seller_name,
+       vl.brand_business_name AS vendor_brand_name
+     FROM products p
+     LEFT JOIN vendor_login vl ON p.vendor_id = vl.id
+     WHERE p.action = '0' AND p.is_active = '1'
+       AND EXISTS (
+         SELECT 1 FROM product_materials pm 
+         WHERE pm.product_id = p.id 
+           AND pm.is_active = '1' 
+           AND (pm.action IS NULL OR pm.action = '0' OR pm.action != '1')
+       )
+     ORDER BY p.id DESC
+     LIMIT 10`,
     { type: QueryTypes.SELECT }
   );
 
@@ -737,6 +925,10 @@ export async function getSuperSaveDealsView(userId) {
     let pid = String(deal.product_id);
     let prodName = deal.product_name;
     let fallbackImg = null;
+    let vendorShopName = deal.vendor_shop_name;
+    let vendorSellerName = deal.vendor_seller_name;
+    let vendorBrandName = deal.vendor_brand_name;
+    let vendorId = deal.vendor_id;
 
     if (!prodName && activeProducts && activeProducts.length > 0) {
       const fallbackProd = activeProducts[idx % activeProducts.length];
@@ -744,14 +936,36 @@ export async function getSuperSaveDealsView(userId) {
         pid = String(fallbackProd.id);
         prodName = fallbackProd.product_name;
         fallbackImg = fallbackProd.main_image;
+        vendorShopName = fallbackProd.vendor_shop_name;
+        vendorSellerName = fallbackProd.vendor_seller_name;
+        vendorBrandName = fallbackProd.vendor_brand_name;
+        vendorId = fallbackProd.vendor_id;
       }
     }
+
+    const canonicalVendorName =
+      vendorShopName ||
+      vendorBrandName ||
+      vendorSellerName ||
+      deal.deal_name ||
+      "Bespoke Atelier";
 
     const materialImgPath = materialImagesMap[pid] || deal.main_image || fallbackImg || null;
 
     return {
       id: deal.id,
-      name: deal.name,
+      deal_name: deal.deal_name,
+      name: canonicalVendorName,
+      vendor_name: canonicalVendorName,
+      vendor_id: vendorId ? Number(vendorId) : null,
+      vendor: vendorId
+        ? {
+            id: Number(vendorId),
+            shop_name: vendorShopName || canonicalVendorName,
+            seller_name: vendorSellerName || null,
+            brand_business_name: vendorBrandName || null,
+          }
+        : null,
       product_id: pid,
       title: deal.title,
       price: deal.price,
@@ -900,6 +1114,13 @@ export async function getWomenWearView(userId, allowAutoHeal = false) {
     FROM women_wear ww
     LEFT JOIN products p ON (ww.product_id = p.id OR ww.product_id = p.product_id)
     WHERE ww.action = '0'
+      AND p.id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM product_materials pm
+        WHERE pm.product_id = p.id
+          AND pm.is_active = '1'
+          AND (pm.action IS NULL OR pm.action = '0' OR pm.action != '1')
+      )
     ORDER BY ww.id ASC
   `;
 

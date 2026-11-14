@@ -61,7 +61,7 @@ export const getMeasurementList = async (req, res) => {
  */
 export const show = async (req, res) => {
   try {
-    const userId = req.params.user_id || req.params.cust_id;
+    const userId = getParam(req, "user_id", "cust_id", "customer_id", "id") || req.params.user_id || req.params.cust_id || req.user?.id;
     const customerMeasurementNameId = getParam(req, "customer_measurement_name_id");
     const nameId = getParam(req, "name_id");
     const authenticatedUserId = req.user?.id;
@@ -153,6 +153,28 @@ export const getMeasurementNames = async (req, res) => {
       status: false,
       message: err.message,
       data: [],
+    });
+  }
+};
+
+/**
+ * Delete an entire measurement profile and its linked measurements
+ * POST /api/customer-measurement/delete?profile_id=...
+ */
+export const deleteProfile = async (req, res) => {
+  try {
+    const profileId =
+      req.query?.profile_id ||
+      req.body?.profile_id ||
+      req.params?.id ||
+      req.body?.id;
+    const result = await customerMeasurementService.deleteProfile(profileId);
+    return res.status(result.statusCode || 200).json(result.body);
+  } catch (err) {
+    console.error("Error in deleteProfile:", err);
+    return res.status(500).json({
+      status: false,
+      message: err.message,
     });
   }
 };

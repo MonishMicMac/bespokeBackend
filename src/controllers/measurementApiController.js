@@ -20,6 +20,11 @@ export const getMeasurementsByPriceId = async (req, res) => {
     return res.status(200).json({
       status: true,
       message: "Measurement details retrieved successfully",
+      is_customizable: data.is_customizable,
+      product_id: data.product_id,
+      price_id: data.price_id,
+      current_size: data.current_size,
+      available_sizes: data.available_sizes,
       data,
     });
   } catch (e) {

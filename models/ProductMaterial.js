@@ -21,7 +21,15 @@ const ProductMaterial = sequelize.define(
       type: DataTypes.BIGINT.UNSIGNED,
       allowNull: false,
     },
+    product_fabric_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+    },
     material_name: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
+    },
+    color_code: {
       type: DataTypes.STRING(100),
       allowNull: true,
     },

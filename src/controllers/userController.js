@@ -16,6 +16,7 @@ import {
   getCustomerProfile,
   updateCustomerProfile,
   getUserDetails,
+  deleteCustomerAccount,
 } from "../services/customerProfileService.js";
 
 /**
@@ -132,8 +133,9 @@ export const update = async (req, res) => {
     const host = req.get("host");
     const protocol = req.protocol || "http";
     const baseUrl = `${protocol}://${host}`;
+    const file = req.file || (req.files && req.files.length > 0 ? req.files[0] : null);
 
-    const result = await updateCustomerProfile(id, req.body, baseUrl);
+    const result = await updateCustomerProfile(id, req.body, baseUrl, file);
     return res.status(result.statusCode || 200).json(result.response);
   } catch (error) {
     console.error("❌ [UsersController::update] error:", error);
@@ -215,6 +217,25 @@ export const resetPassword = async (req, res) => {
     return res.status(500).json({
       status: "false",
       message: error.message || "An error occurred resetting password",
+    });
+  }
+};
+
+/**
+ * Customer Account Deletion / Soft-delete
+ * Method: POST / DELETE
+ * Endpoint: /api/user/delete/:id
+ */
+export const deleteAccount = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await deleteCustomerAccount(id);
+    return res.status(result.statusCode || 200).json(result.response);
+  } catch (error) {
+    console.error("❌ [UsersController::deleteAccount] error:", error);
+    return res.status(500).json({
+      status: "false",
+      message: error.message || "An error occurred deleting account",
     });
   }
 };

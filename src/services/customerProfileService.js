@@ -2,6 +2,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Op } from "sequelize";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import s3 from "../../config/s3.js";
 import UserLogin from "../../models/UserLogin.js";
 import UserAddress from "../../models/UserAddress.js";
 import { formatCustomerAddress } from "./addressService.js";
@@ -52,7 +54,7 @@ export async function getCustomerProfile(id) {
 /**
  * API 4: Customer Profile Update
  */
-export async function updateCustomerProfile(id, data, baseUrl = "") {
+export async function updateCustomerProfile(id, data, baseUrl = "", file = null) {
   const user = await UserLogin.findByPk(id);
 
   if (!user) {
@@ -110,6 +112,8 @@ export async function updateCustomerProfile(id, data, baseUrl = "") {
   }
   if (data.username !== undefined) {
     user.username = String(data.username).trim();
+  } else if (data.name !== undefined) {
+    user.username = String(data.name).trim();
   }
   if (data.mobile !== undefined) {
     user.mobile = String(data.mobile).trim();
@@ -177,22 +181,66 @@ export async function updateCustomerProfile(id, data, baseUrl = "") {
         };
       }
 
+      const bucketName = process.env.AWS_BUCKET_NAME || "bespoke-2026";
+      const region = process.env.AWS_DEFAULT_REGION || "ap-south-1";
       const imageName = `user_${id}_${Date.now()}.${imageType}`;
-      const uploadDir = path.resolve(__dirname, "../../uploads/users");
+      const s3Key = `users/${imageName}`;
+      const contentType =
+        declaredType === "jpg" || declaredType === "jpeg"
+          ? "image/jpeg"
+          : `image/${declaredType}`;
 
-      if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
+      try {
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: bucketName,
+            Key: s3Key,
+            Body: buffer,
+            ContentType: contentType,
+          })
+        );
+        user.img_path = `https://${bucketName}.s3.${region}.amazonaws.com/${s3Key}`;
+        console.log(`✅ [CustomerProfileService] Uploaded avatar to S3: ${user.img_path}`);
+      } catch (s3Err) {
+        console.error("❌ [CustomerProfileService] S3 upload error, fallback to local:", s3Err);
+        const uploadDir = path.resolve(__dirname, "../../uploads/users");
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(uploadDir, imageName), buffer);
+        const resolvedBase = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+        user.img_path = `${resolvedBase}/uploads/users/${imageName}`;
       }
-
-      fs.writeFileSync(path.join(uploadDir, imageName), buffer);
-
-      const resolvedBase = baseUrl ? baseUrl.replace(/\/$/, "") : "";
-      user.img_path = `${resolvedBase}/uploads/users/${imageName}`;
     } else {
       return {
         statusCode: 400,
         response: { status: "false", message: "Invalid image format" },
       };
+    }
+  }
+
+  // Handle Multipart File Upload if present
+  if (file && file.buffer) {
+    try {
+      const bucketName = process.env.AWS_BUCKET_NAME || "bespoke-2026";
+      const region = process.env.AWS_DEFAULT_REGION || "ap-south-1";
+      const ext = file.originalname ? file.originalname.split(".").pop().toLowerCase() : "png";
+      const imageName = `user_${id}_${Date.now()}.${ext}`;
+      const s3Key = `users/${imageName}`;
+      const contentType = file.mimetype || "image/png";
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName,
+          Key: s3Key,
+          Body: file.buffer,
+          ContentType: contentType,
+        })
+      );
+      user.img_path = `https://${bucketName}.s3.${region}.amazonaws.com/${s3Key}`;
+      console.log(`✅ [CustomerProfileService] Multipart avatar uploaded to S3: ${user.img_path}`);
+    } catch (s3Err) {
+      console.error("❌ [CustomerProfileService] Multipart S3 upload error:", s3Err);
     }
   }
 
@@ -255,5 +303,30 @@ export async function getUserDetails(id) {
     },
   };
 }
+
+export async function deleteCustomerAccount(id) {
+  const user = await UserLogin.findByPk(id);
+  if (!user) {
+    return {
+      statusCode: 404,
+      response: {
+        status: "false",
+        message: "User not found",
+      },
+    };
+  }
+
+  user.action = "1";
+  await user.save();
+
+  return {
+    statusCode: 200,
+    response: {
+      status: "true",
+      message: "Account deleted successfully",
+    },
+  };
+}
+
 
 

@@ -1,6 +1,8 @@
 import Notification from "../../models/Notification.js";
+import TicketMessage from "../../models/TicketMessage.js";
 import { Op } from "sequelize";
 import { emitToVendor, emitToAdmin, emitToUser } from "../sockets/socket.js";
+import NotificationService from "../services/notificationService.js";
 
 /**
  * Get notifications with filters and pagination
@@ -31,10 +33,14 @@ export const getNotifications = async (req, res) => {
       } else {
         whereClause.recipient_type = targetRecipientType;
         if (targetRecipientId) {
-          whereClause[Op.or] = [
-            { recipient_id: String(targetRecipientId) },
-            { recipient_id: null }, // broadcast notifications to all of this type
-          ];
+          if (targetRecipientType === "user") {
+            whereClause.recipient_id = String(targetRecipientId);
+          } else {
+            whereClause[Op.or] = [
+              { recipient_id: String(targetRecipientId) },
+              { recipient_id: null }, // broadcast notifications to all of this type
+            ];
+          }
         }
       }
     } else if (targetRecipientId) {
@@ -101,10 +107,14 @@ export const getUnreadCount = async (req, res) => {
       whereClause.recipient_type = targetRecipientType;
     }
     if (targetRecipientId) {
-      whereClause[Op.or] = [
-        { recipient_id: String(targetRecipientId) },
-        { recipient_id: null },
-      ];
+      if (targetRecipientType === "user") {
+        whereClause.recipient_id = String(targetRecipientId);
+      } else {
+        whereClause[Op.or] = [
+          { recipient_id: String(targetRecipientId) },
+          { recipient_id: null },
+        ];
+      }
     }
 
     const unreadCount = await Notification.count({ where: whereClause });
@@ -184,10 +194,14 @@ export const markAllNotificationsRead = async (req, res) => {
       whereClause.recipient_type = targetRecipientType;
     }
     if (targetRecipientId) {
-      whereClause[Op.or] = [
-        { recipient_id: String(targetRecipientId) },
-        { recipient_id: null },
-      ];
+      if (targetRecipientType === "user") {
+        whereClause.recipient_id = String(targetRecipientId);
+      } else {
+        whereClause[Op.or] = [
+          { recipient_id: String(targetRecipientId) },
+          { recipient_id: null },
+        ];
+      }
     }
 
     const [updatedCount] = await Notification.update(
@@ -197,6 +211,22 @@ export const markAllNotificationsRead = async (req, res) => {
       },
       { where: whereClause }
     );
+
+    // Also mark ticket_messages as seen for this user
+    if (targetRecipientType === "user" && targetRecipientId) {
+      const cleanUid = parseInt(String(targetRecipientId).replace(/[^0-9]/g, ""), 10);
+      if (cleanUid) {
+        await TicketMessage.update(
+          { seen_at: new Date() },
+          {
+            where: {
+              receiver_id: cleanUid,
+              seen_at: null,
+            },
+          }
+        ).catch(() => {});
+      }
+    }
 
     return res.status(200).json({
       success: true,
@@ -257,6 +287,10 @@ export const createNotification = async (req, res) => {
       title,
       message,
       type = "general",
+      related_ticket_id = null,
+      related_message_id = null,
+      related_order_id = null,
+      related_sale_order_id = null,
       data = null,
     } = req.body;
 
@@ -267,26 +301,21 @@ export const createNotification = async (req, res) => {
       });
     }
 
-    const newNotification = await Notification.create({
+    const newNotification = await NotificationService.createAndDispatchNotification({
       recipient_type,
       recipient_id: recipient_id ? String(recipient_id) : null,
       title,
       message,
       type,
-      data,
-      is_read: false,
+      related_ticket_id,
+      related_message_id,
+      related_order_id,
+      related_sale_order_id,
+      data: data || {},
+      sendPush: true,
+      sendSocket: true,
+      publishRedis: true,
     });
-
-    const payload = newNotification.toJSON();
-
-    // Emit socket event to the recipient
-    if (recipient_type === "admin") {
-      emitToAdmin("admin-notification", payload);
-    } else if (recipient_type === "vendor" && recipient_id) {
-      emitToVendor(recipient_id, "vendor-notification", payload);
-    } else if (recipient_id) {
-      emitToUser(recipient_id, "notification", payload);
-    }
 
     return res.status(201).json({
       success: true,

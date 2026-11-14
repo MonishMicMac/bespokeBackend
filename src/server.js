@@ -1,4 +1,12 @@
 import "dotenv/config";
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("⚠️ Unhandled Rejection at:", promise, "reason:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught Exception:", err);
+});
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -10,12 +18,15 @@ import cors from "cors";
 
 import "./redis/orderSubscriber.js"; // Listen to Redis Jobs
 import { initSocket } from "./sockets/socket.js";
+import { initTicketWatcher } from "./services/ticketWatcher.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
 import signupRoutes from "./routes/signupRoutes.js";
 import saleOrderRoutes from "./routes/saleOrderRoutes.js";
 import refundRoutes from "./routes/refundRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
+import firebaseRoutes from "./routes/firebaseRoutes.js";
+import ticketRoutes from "./routes/ticketRoutes.js";
 import productRoutes from "./routes/productRoutes.js";
 import customerAuthRoutes from "./routes/customerAuthRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
@@ -29,6 +40,8 @@ import userAddressRoutes from "./routes/userAddressRoutes.js";
 import measurementRoutes from "./routes/measurementRoutes.js";
 import promoRoutes from "./routes/promoRoutes.js";
 import reviewRoutes from "./routes/reviewRoutes.js";
+import searchRoutes from "./routes/searchRoutes.js";
+import invoiceRoutes from "./routes/invoiceRoutes.js";
 import path from "path";
 import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
@@ -110,6 +123,10 @@ app.use("/api/favourites", wishlistRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/bag", cartRoutes);
 
+// Global Search & Dynamic Faceted Filtering Routes
+app.use("/api/search", searchRoutes);
+app.use("/search", searchRoutes);
+
 // Product and catalog routes
 app.use("/api", productRoutes);
 app.use("/api/vendor", productRoutes);
@@ -124,12 +141,20 @@ app.use("/api/vendor", orderRoutes);
 app.use("/api/vendor", saleOrderRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/chat", chatRoutes);
+app.use("/api", ticketRoutes);
+app.use("/", ticketRoutes);
 app.use("/api/vendor", signupRoutes);
 app.use("/api/vendor", refundRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/vendor/notifications", notificationRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/vendor/notifications", notificationRoutes);
+app.use("/api", firebaseRoutes);
+app.use("/", firebaseRoutes);
+
+// Complete Invoice System Routes
+app.use("/api", invoiceRoutes);
+app.use("/", invoiceRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
@@ -156,6 +181,8 @@ async function connectDB() {
     } catch (e) {
       console.warn("Notice checking messages sale_order_id column:", e.message);
     }
+    // Initialize TicketWatcher to detect Admin replies & sync notifications in real-time
+    initTicketWatcher();
   } catch (error) {
     console.error("❌ Database Connection Failed:", error);
   }
@@ -164,6 +191,15 @@ async function connectDB() {
 connectDB();
 
 const PORT = process.env.PORT || 8080;
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`❌ Port ${PORT} is already in use by another process. Please free port ${PORT} before starting.`);
+  } else {
+    console.error("❌ Server error:", err);
+  }
+  process.exit(1);
+});
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);

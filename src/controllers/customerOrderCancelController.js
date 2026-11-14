@@ -1,7 +1,104 @@
 import OrderCancelReturnService from "../services/orderCancelReturnService.js";
 import OrderHistoryTimelineService from "../services/orderHistoryTimelineService.js";
+import { SaleOrder, Order } from "../../models/setupAssociations.js";
 
 class CustomerOrderCancelController {
+  /**
+   * Helper to resolve sale_order_id across JSON, multipart/form-data, query parameters,
+   * camelCase aliases, or parent order_id / alphanumeric order code (e.g. ORD1113).
+   *
+   * @param {Object} req Express request
+   * @returns {Promise<number|null>}
+   */
+  static async resolveSaleOrderId(req) {
+    const query = req.query || {};
+    const body = req.body || {};
+    const params = req.params || {};
+
+    const rawSaleOrderId =
+      body.sale_order_id ||
+      body.saleOrderId ||
+      body.sale_id ||
+      body.saleId ||
+      body.id ||
+      query.sale_order_id ||
+      query.saleOrderId ||
+      query.sale_id ||
+      query.saleId ||
+      query.id ||
+      params.sale_order_id ||
+      params.id;
+
+    const rawOrderId =
+      body.order_id ||
+      body.orderId ||
+      body.order_code ||
+      query.order_id ||
+      query.orderId ||
+      query.order_code ||
+      params.order_id;
+
+    let parsedSaleOrderId = parseInt(rawSaleOrderId, 10);
+
+    // 1. If parsedSaleOrderId is a valid number, check if it matches a SaleOrder directly
+    if (parsedSaleOrderId && !isNaN(parsedSaleOrderId)) {
+      const existingSo = await SaleOrder.findByPk(parsedSaleOrderId);
+      if (existingSo) {
+        return parsedSaleOrderId;
+      }
+      // If no SaleOrder with this PK, it might be an Order.id (parent order id)
+      const soByParentId = await SaleOrder.findOne({
+        where: { order_id: parsedSaleOrderId },
+        order: [["id", "ASC"]],
+      });
+      if (soByParentId) {
+        return soByParentId.id;
+      }
+    }
+
+    // 2. If rawSaleOrderId was a non-numeric string (e.g. "ORD1113"), search Order by order_id
+    if (rawSaleOrderId && isNaN(parsedSaleOrderId)) {
+      const order = await Order.findOne({
+        where: { order_id: String(rawSaleOrderId).trim() },
+      });
+      if (order) {
+        const so = await SaleOrder.findOne({
+          where: { order_id: order.id },
+          order: [["id", "ASC"]],
+        });
+        if (so) return so.id;
+      }
+    }
+
+    // 3. Fallback to rawOrderId
+    if (rawOrderId) {
+      const parsedOrderId = parseInt(rawOrderId, 10);
+      let order = null;
+      if (!isNaN(parsedOrderId)) {
+        order = await Order.findByPk(parsedOrderId);
+      }
+      if (!order) {
+        order = await Order.findOne({
+          where: { order_id: String(rawOrderId).trim() },
+        });
+      }
+      if (order) {
+        const so = await SaleOrder.findOne({
+          where: { order_id: order.id },
+          order: [["id", "ASC"]],
+        });
+        if (so) return so.id;
+      } else if (!isNaN(parsedOrderId)) {
+        const so = await SaleOrder.findOne({
+          where: { order_id: parsedOrderId },
+          order: [["id", "ASC"]],
+        });
+        if (so) return so.id;
+      }
+    }
+
+    return null;
+  }
   /**
    * GET /api/customer/order/cancel-reasons
    */
@@ -53,7 +150,7 @@ class CustomerOrderCancelController {
     try {
       const query = req.query || {};
       const body = req.body || {};
-      const saleOrderId = parseInt(query.sale_order_id || body.sale_order_id, 10);
+      const saleOrderId = await CustomerOrderCancelController.resolveSaleOrderId(req);
       const orderHistory = query.order_history || body.order_history || null;
       const direction = query.direction || body.direction || "desc";
 
@@ -86,7 +183,7 @@ class CustomerOrderCancelController {
       const query = req.query || {};
       const body = req.body || {};
 
-      if (req.method === "GET" && !query.sale_order_id) {
+      if (req.method === "GET" && !query.sale_order_id && !query.order_id) {
         const info = OrderCancelReturnService.getReasons();
         return res.status(200).json({
           status: true,
@@ -101,7 +198,7 @@ class CustomerOrderCancelController {
         });
       }
 
-      const saleOrderId = parseInt(body.sale_order_id || query.sale_order_id, 10);
+      const saleOrderId = await CustomerOrderCancelController.resolveSaleOrderId(req);
       if (!saleOrderId || isNaN(saleOrderId)) {
         return res.status(422).json({
           status: false,
@@ -160,7 +257,7 @@ class CustomerOrderCancelController {
       const query = req.query || {};
       const body = req.body || {};
 
-      if (req.method === "GET" && !query.sale_order_id) {
+      if (req.method === "GET" && !query.sale_order_id && !query.order_id) {
         const info = OrderCancelReturnService.getReasons();
         return res.status(200).json({
           status: true,
@@ -176,7 +273,7 @@ class CustomerOrderCancelController {
         });
       }
 
-      const saleOrderId = parseInt(body.sale_order_id || query.sale_order_id, 10);
+      const saleOrderId = await CustomerOrderCancelController.resolveSaleOrderId(req);
       if (!saleOrderId || isNaN(saleOrderId)) {
         return res.status(422).json({
           status: false,

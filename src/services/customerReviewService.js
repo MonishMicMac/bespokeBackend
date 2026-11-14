@@ -157,19 +157,34 @@ class CustomerReviewService {
       }
     }
 
-    // 5. Database transaction: store CustomerReview and ReviewImage
+    // 5. Database transaction: upsert CustomerReview and store ReviewImage
     const t = await sequelize.transaction();
     try {
-      const review = await CustomerReview.create(
-        {
+      let review = await CustomerReview.findOne({
+        where: {
           user_id: numUserId,
           product_id: numProductId,
-          rating: numRating,
-          comments: comments || null,
-          review_date: new Date(),
         },
-        { transaction: t }
-      );
+        transaction: t,
+      });
+
+      if (review) {
+        review.rating = numRating;
+        review.comments = comments || null;
+        review.review_date = new Date();
+        await review.save({ transaction: t });
+      } else {
+        review = await CustomerReview.create(
+          {
+            user_id: numUserId,
+            product_id: numProductId,
+            rating: numRating,
+            comments: comments || null,
+            review_date: new Date(),
+          },
+          { transaction: t }
+        );
+      }
 
       for (const key of uploadedS3Keys) {
         await ReviewImage.create(

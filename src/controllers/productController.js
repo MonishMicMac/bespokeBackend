@@ -18,16 +18,30 @@ export const getProducts = async (req, res) => {
     const {
       page = 1,
       limit = 50,
-      category,
-      subcategory,
+      category: rawCategory,
+      category_id,
+      subcategory: rawSubcategory,
+      subcategory_id,
       gender,
       vendor_id,
       search,
       sort,
     } = req.query;
 
+    const category = rawCategory || category_id;
+    const subcategory = rawSubcategory || subcategory_id;
+
     const offset = (Math.max(1, parseInt(page, 10)) - 1) * parseInt(limit, 10);
-    const whereClauses = ["(p.action IS NULL OR p.action != '1')"];
+    const whereClauses = [
+      "(p.action IS NULL OR p.action != '1')",
+      "(p.is_active IS NULL OR p.is_active != '0')",
+      `EXISTS (
+        SELECT 1 FROM product_materials pm 
+        WHERE pm.product_id = p.id 
+          AND pm.is_active = '1' 
+          AND (pm.action IS NULL OR pm.action = '0' OR pm.action != '1')
+      )`,
+    ];
     const replacements = [];
 
     if (category) {
@@ -127,7 +141,7 @@ export const getProducts = async (req, res) => {
         (
           SELECT pmi.img_path 
           FROM product_material_images pmi 
-          WHERE pmi.product_id = p.id AND (pmi.action IS NULL OR pmi.action != 1) 
+          WHERE pmi.product_id = p.id AND (pmi.action IS NULL OR pmi.action != '1') 
           ORDER BY pmi.id ASC LIMIT 1
         ) as material_img,
         (
@@ -164,7 +178,83 @@ export const getProducts = async (req, res) => {
       type: QueryTypes.SELECT,
     });
 
-    const formatted = products.map((prod) => {
+    // Fetch all sizes and materials for these products to power dynamic filtering
+    const productIds = products.map((p) => p.id);
+    const sizeMap = {};
+    const materialMap = {};
+
+    if (productIds.length > 0) {
+      try {
+        const [allPrices] = await sequelize.query(
+          `SELECT DISTINCT product_id, size FROM product_prices WHERE product_id IN (?) AND size IS NOT NULL AND size != ''`,
+          { replacements: [productIds] }
+        );
+        allPrices.forEach((row) => {
+          if (!sizeMap[row.product_id]) sizeMap[row.product_id] = [];
+          if (!sizeMap[row.product_id].includes(row.size)) {
+            sizeMap[row.product_id].push(row.size);
+          }
+        });
+
+        const [allMaterials] = await sequelize.query(
+          `SELECT pm.id, pm.product_id, pm.name, pm.material_name, pm.description, pm.main_img_path,
+                  (SELECT pmi.img_path FROM product_material_images pmi WHERE pmi.product_material_id = pm.id AND (pmi.action IS NULL OR pmi.action != '1') LIMIT 1) as mat_image,
+                  (SELECT pp.discount_price FROM product_prices pp WHERE pp.material_id = pm.id AND pp.discount_price > 0 LIMIT 1) as discount_price,
+                  (SELECT pp.actual_price FROM product_prices pp WHERE pp.material_id = pm.id LIMIT 1) as actual_price
+           FROM product_materials pm
+           WHERE pm.product_id IN (?) AND (pm.action IS NULL OR pm.action != '1') AND pm.is_active = '1'
+           ORDER BY pm.id ASC`,
+          { replacements: [productIds] }
+        );
+
+        const [allPricesWithMat] = await sequelize.query(
+          `SELECT material_id, product_id, size, discount_price, actual_price FROM product_prices WHERE product_id IN (?) AND (is_out_stock IS NULL OR is_out_stock != '1')`,
+          { replacements: [productIds] }
+        );
+
+        allMaterials.forEach((row) => {
+          if (!materialMap[row.product_id]) materialMap[row.product_id] = [];
+          const mSizes = [];
+          let bestDisc = parseFloat(row.discount_price) || 0;
+          let bestAct = parseFloat(row.actual_price) || 0;
+          allPricesWithMat.filter((mp) => mp.material_id === row.id).forEach((mp) => {
+            if (mp.size && !mSizes.includes(mp.size)) mSizes.push(mp.size);
+            const d = parseFloat(mp.discount_price) || 0;
+            const a = parseFloat(mp.actual_price) || 0;
+            if (d > 0 && (bestDisc === 0 || d < bestDisc)) bestDisc = d;
+            if (a > 0 && (bestAct === 0 || a < bestAct)) bestAct = a;
+          });
+
+          materialMap[row.product_id].push({
+            id: row.id,
+            material_id: row.id,
+            product_id: row.product_id,
+            name: row.name || "",
+            material_name: row.material_name || "",
+            description: row.description || "",
+            image: formatImageUrl(row.mat_image || row.main_img_path),
+            price: bestDisc > 0 ? bestDisc : bestAct,
+            original_price: bestAct > 0 ? bestAct : bestDisc,
+            sizes: mSizes,
+          });
+        });
+      } catch (err) {
+        console.warn("Could not fetch auxiliary product sizes/materials:", err.message);
+      }
+    }
+
+    const KNOWN_FABRICS = [
+      "cotton", "silk", "polyester", "linen", "georgette", "chiffon", "rayon",
+      "velvet", "satin", "tulle", "wool", "denim", "organza", "crepe"
+    ];
+    const KNOWN_COLORS = [
+      "black", "white", "red", "blue", "green", "yellow", "pink", "maroon",
+      "grey", "purple", "orange", "gold", "silver", "beige", "brown", "navy"
+    ];
+
+    const expandedFormatted = [];
+
+    products.forEach((prod) => {
       const rawImg = prod.material_img || prod.main_image;
       const fullImg = formatImageUrl(rawImg);
       const priceNum = parseFloat(prod.price) || parseFloat(prod.original_price) || 0;
@@ -175,12 +265,76 @@ export const getProducts = async (req, res) => {
           : 0;
 
       const brand =
-        prod.brand_business_name ||
         prod.shop_name ||
         prod.seller_name ||
+        prod.brand_business_name ||
         "Bespoke Studio";
 
-      return {
+      const pMats = materialMap[prod.id] || [];
+      const pSizes = sizeMap[prod.id] || [];
+      const allText = `${prod.product_name || ""} ${prod.description || ""} ${pMats.map(m => `${m.name || ""} ${m.material_name || ""}`).join(" ")}`.toLowerCase();
+
+      // Extract fabrics
+      const fabrics = [];
+      pMats.forEach(m => {
+        const n = (m.name || "").trim();
+        const mn = (m.material_name || "").trim();
+        KNOWN_FABRICS.forEach(f => {
+          if (n.toLowerCase().includes(f) || mn.toLowerCase().includes(f)) {
+            const cap = f.charAt(0).toUpperCase() + f.slice(1);
+            if (!fabrics.includes(cap)) fabrics.push(cap);
+          }
+        });
+      });
+      KNOWN_FABRICS.forEach(f => {
+        if (allText.includes(f)) {
+          const cap = f.charAt(0).toUpperCase() + f.slice(1);
+          if (!fabrics.includes(cap)) fabrics.push(cap);
+        }
+      });
+      if (fabrics.length === 0) fabrics.push("Cotton");
+
+      // Extract colors
+      const colors = [];
+      pMats.forEach(m => {
+        const n = (m.name || "").trim();
+        const mn = (m.material_name || "").trim();
+        KNOWN_COLORS.forEach(c => {
+          if (n.toLowerCase().includes(c) || mn.toLowerCase().includes(c)) {
+            const cap = c.charAt(0).toUpperCase() + c.slice(1);
+            if (!colors.includes(cap)) colors.push(cap);
+          }
+        });
+      });
+      KNOWN_COLORS.forEach(c => {
+        if (allText.includes(c)) {
+          const cap = c.charAt(0).toUpperCase() + c.slice(1);
+          if (!colors.includes(cap)) colors.push(cap);
+        }
+      });
+      if (colors.length === 0) colors.push("Multicolor");
+
+      // Extract occasions
+      const occasions = [];
+      const catLower = (prod.category_name || prod.category || "").toLowerCase();
+      const subcatLower = (prod.subcategory_name || prod.subcategory || "").toLowerCase();
+      if (allText.includes("wedding") || catLower.includes("wedding") || catLower.includes("banarasi")) {
+        occasions.push("Wedding");
+      }
+      if (allText.includes("festival") || allText.includes("festive") || catLower.includes("traditional") || catLower.includes("fusion")) {
+        occasions.push("Festive");
+      }
+      if (allText.includes("party") || allText.includes("evening") || allText.includes("celebration")) {
+        occasions.push("Party");
+      }
+      if (allText.includes("formal") || allText.includes("boardroom") || allText.includes("office") || catLower.includes("formal")) {
+        occasions.push("Formal");
+      }
+      if (allText.includes("casual") || catLower.includes("casual") || subcatLower.includes("t shirt") || catLower.includes("jeans") || occasions.length === 0) {
+        occasions.push("Casual");
+      }
+
+      const baseProd = {
         id: prod.id,
         product_id: prod.product_id,
         price_id: prod.price_id || null,
@@ -195,7 +349,7 @@ export const getProducts = async (req, res) => {
         subcategory_id: prod.subcategory,
         subcategory: prod.subcategory_name || prod.subcategory,
         subcategory_name: prod.subcategory_name,
-        gender: prod.gender || "unisex",
+        gender: prod.gender || (catLower.includes("mens") || catLower.includes("men") ? "male" : catLower.includes("girls") || catLower.includes("kids") ? "kids" : "unisex"),
         vendor_id: prod.vendor_id,
         vendor_name: brand,
         brand: brand,
@@ -216,21 +370,119 @@ export const getProducts = async (req, res) => {
         rating_count: Math.floor(Math.random() * 30) + 12, // realistic mock reviews count
         is_active: prod.is_active === "1" || prod.is_active === 1,
         created_at: prod.created_at,
+        sizes: pSizes,
+        fabrics: fabrics,
+        fabric: fabrics[0] || "Cotton",
+        colors: colors,
+        color: colors[0] || "Multicolor",
+        occasions: occasions,
+        occasion: occasions[0] || "Casual",
+        materials: pMats,
+        product_materials: pMats,
       };
+
+      if (pMats.length > 0) {
+        // Expand each variant/material as a separate item in the list
+        pMats.forEach((mat, mIdx) => {
+          const n = (mat.name || "").trim();
+          const mn = (mat.material_name || "").trim();
+          let variantName = mn;
+          if (!isNaN(mn) && isNaN(n) && n.length > 0) variantName = n;
+          else if (!isNaN(n) && isNaN(mn) && mn.length > 0) variantName = mn;
+          else if (KNOWN_COLORS.some(c => mn.toLowerCase().includes(c))) variantName = mn;
+          else if (KNOWN_COLORS.some(c => n.toLowerCase().includes(c))) variantName = n;
+          else if (KNOWN_FABRICS.some(f => mn.toLowerCase().includes(f))) variantName = mn;
+          else if (KNOWN_FABRICS.some(f => n.toLowerCase().includes(f))) variantName = n;
+          else if (mn && mn.toLowerCase() !== "ready" && mn.toLowerCase() !== "test") variantName = mn;
+          else if (n && n.toLowerCase() !== "test") variantName = n;
+          else variantName = mn || n || "";
+
+          const variantImg = mat.image || fullImg;
+          const variantPrice = mat.price > 0 ? mat.price : priceNum;
+          const variantOrig = mat.original_price > 0 ? mat.original_price : origPriceNum;
+          const variantDiscount =
+            variantOrig > variantPrice && variantOrig > 0
+              ? Math.round(((variantOrig - variantPrice) / variantOrig) * 100)
+              : discountPercent;
+
+          const displayTitle =
+            (pMats.length > 1 && variantName && !prod.product_name.toLowerCase().includes(variantName.toLowerCase()))
+              ? `${prod.product_name} - ${variantName}`
+              : prod.product_name;
+
+          // Variant specific fabrics & colors
+          const variantFabrics = [];
+          KNOWN_FABRICS.forEach((f) => {
+            if (
+              mat.name.toLowerCase().includes(f) ||
+              mat.material_name.toLowerCase().includes(f)
+            ) {
+              const cap = f.charAt(0).toUpperCase() + f.slice(1);
+              if (!variantFabrics.includes(cap)) variantFabrics.push(cap);
+            }
+          });
+          if (variantFabrics.length === 0) variantFabrics.push(...fabrics);
+
+          const variantColors = [];
+          KNOWN_COLORS.forEach((c) => {
+            if (
+              mat.name.toLowerCase().includes(c) ||
+              mat.material_name.toLowerCase().includes(c)
+            ) {
+              const cap = c.charAt(0).toUpperCase() + c.slice(1);
+              if (!variantColors.includes(cap)) variantColors.push(cap);
+            }
+          });
+          if (variantColors.length === 0 && variantName) {
+            variantColors.push(variantName);
+          }
+          if (variantColors.length === 0) variantColors.push(...colors);
+
+          expandedFormatted.push({
+            ...baseProd,
+            unique_id: `${prod.id}-${mat.id}`,
+            variant_id: mat.id,
+            material_id: mat.id,
+            selectedMaterialId: mat.id,
+            selectedMaterialIdx: mIdx,
+            title: displayTitle,
+            name: displayTitle,
+            variant_name: variantName,
+            material_name: mat.material_name || "",
+            image: variantImg,
+            main_image: variantImg,
+            images: [variantImg],
+            price: variantPrice,
+            original_price: variantOrig,
+            discount_percentage: variantDiscount,
+            discount_label: variantDiscount > 0 ? `${variantDiscount}% OFF` : null,
+            sizes: mat.sizes?.length > 0 ? mat.sizes : pSizes,
+            fabrics: variantFabrics,
+            fabric: variantFabrics[0] || "Cotton",
+            colors: variantColors,
+            color: variantColors[0] || "Multicolor",
+          });
+        });
+      } else {
+        expandedFormatted.push({
+          ...baseProd,
+          unique_id: String(prod.id),
+        });
+      }
     });
 
     res.json({
       status: true,
       message: "Products fetched successfully",
-      count: formatted.length,
-      total,
-      data: formatted,
-      products: formatted,
+      count: expandedFormatted.length,
+      total: expandedFormatted.length,
+      data: expandedFormatted,
+      products: expandedFormatted,
       pagination: {
         page: parseInt(page, 10),
         limit: parseInt(limit, 10),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit, 10)),
+        total: expandedFormatted.length,
+        totalPages: Math.ceil(expandedFormatted.length / parseInt(limit, 10)),
       },
     });
   } catch (error) {
@@ -279,14 +531,27 @@ export const getProductById = async (req, res) => {
       type: QueryTypes.SELECT,
     });
 
-    if (!product) {
+    if (!product || product.action === '1' || product.is_active === '0') {
       return res.status(404).json({
         status: false,
-        message: "Product not found",
+        message: "Product not found or is currently inactive",
       });
     }
 
     const productId = product.id;
+
+    // Check if product has at least one active material in product_materials (is_active = '1')
+    const [activeMatCheck] = await sequelize.query(
+      `SELECT id FROM product_materials WHERE product_id = ? AND is_active = '1' AND (action IS NULL OR action = '0' OR action != '1') LIMIT 1`,
+      { replacements: [productId], type: QueryTypes.SELECT }
+    );
+
+    if (!activeMatCheck) {
+      return res.status(404).json({
+        status: false,
+        message: "This product is currently inactive or out of stock",
+      });
+    }
 
     // Fetch prices with size breakdown
     const prices = await sequelize.query(
@@ -294,33 +559,33 @@ export const getProductById = async (req, res) => {
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
-    // Fetch materials
+    // Fetch materials (only active materials where is_active = '1')
     const materials = await sequelize.query(
-      `SELECT * FROM product_materials WHERE product_id = ? AND (action IS NULL OR action != 1)`,
+      `SELECT * FROM product_materials WHERE product_id = ? AND (action IS NULL OR action != '1') AND is_active = '1'`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
     // Fetch material images
     const matImages = await sequelize.query(
-      `SELECT * FROM product_material_images WHERE product_id = ? AND (action IS NULL OR action != 1) ORDER BY id ASC`,
+      `SELECT * FROM product_material_images WHERE product_id = ? AND (action IS NULL OR action != '1') ORDER BY id ASC`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
     // Fetch general product images
     const generalImages = await sequelize.query(
-      `SELECT * FROM product_images WHERE product_id = ? AND (action IS NULL OR action != 1) ORDER BY id ASC`,
+      `SELECT * FROM product_images WHERE product_id = ? AND (action IS NULL OR action != '1') ORDER BY id ASC`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
     // Fetch specifications / info
     const infoItems = await sequelize.query(
-      `SELECT details_name, details_value FROM product_info WHERE product_id = ? AND (action IS NULL OR action != 1)`,
+      `SELECT details_name, details_value FROM product_info WHERE product_id = ? AND (action IS NULL OR action != '1')`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
     // Fetch size details if available
     const sizeDetails = await sequelize.query(
-      `SELECT * FROM product_size_details WHERE product_id = ? AND (action IS NULL OR action != 1)`,
+      `SELECT * FROM product_size_details WHERE product_id = ? AND (action IS NULL OR action != '1')`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
@@ -363,7 +628,7 @@ export const getProductById = async (req, res) => {
           price: discount > 0 ? discount : actual,
           original_price: actual,
           qty: p.qty || 0,
-          in_stock: p.is_out_stock !== "1" && p.is_out_stock !== 1 && (p.qty === null || p.qty > 0),
+          in_stock: String(p.is_out_stock) !== "1",
         });
       }
     });
@@ -423,9 +688,9 @@ export const getProductById = async (req, res) => {
 
     // Vendor details
     const brand =
-      product.brand_business_name ||
       product.shop_name ||
       product.seller_name ||
+      product.brand_business_name ||
       "Bespoke Studio";
 
     const vendorDetails = {
@@ -454,7 +719,11 @@ export const getProductById = async (req, res) => {
         v.shop_name, v.brand_business_name
       FROM products p
       LEFT JOIN vendor_login v ON p.vendor_id = v.id
-      WHERE p.category = ? AND p.id != ? AND (p.action IS NULL OR p.action != 1)
+      WHERE p.category = ? AND p.id != ? AND (p.action IS NULL OR p.action != '1')
+        AND EXISTS (
+          SELECT 1 FROM product_materials pm
+          WHERE pm.product_id = p.id AND pm.is_active = '1' AND (pm.action IS NULL OR pm.action != '1')
+        )
       LIMIT 8
       `,
       { replacements: [product.category, productId], type: QueryTypes.SELECT }
@@ -467,7 +736,7 @@ export const getProductById = async (req, res) => {
         id: r.id,
         name: r.product_name,
         product_name: r.product_name,
-        brand: r.brand_business_name || r.shop_name || "Bespoke",
+        brand: r.shop_name || r.seller_name || r.brand_business_name || "Bespoke",
         image: formatImageUrl(r.mat_img),
         price: priceNum,
         original_price: origNum,
