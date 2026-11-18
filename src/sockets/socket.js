@@ -43,9 +43,18 @@ export function initSocket(io) {
     socket.join(cleanId);
     socket.join(`vendor_${cleanId}`);
 
+    socket.userId = cleanId;
+    const recipientType = strId.startsWith("vendor_") ? "vendor" : (strId.includes("admin") ? "admin" : "user");
+    socket.recipientType = recipientType;
+
     console.log(`User/Vendor/Admin ${strId} (clean: ${cleanId}) registered with socket ${socket.id}`);
     io.emit("user_status", { userId: strId, status: "online" });
     broadcastOnlineUsers();
+
+    // Immediately push live unread notification count over WebSocket on connection
+    NotificationService.getUnreadCountHelper({ recipientType, recipientId: cleanId }).then((cnt) => {
+      socket.emit("unread_count:update", { unread_count: cnt });
+    }).catch(() => {});
   }
 
   io.on("connection", (socket) => {
@@ -58,6 +67,48 @@ export function initSocket(io) {
     // Register Users on explicit Connect event
     socket.on("register", (userId) => {
       registerUser(socket, userId);
+    });
+
+    // Realtime WebSocket Notification Handlers (Eliminates HTTP Polling)
+    socket.on("get_unread_count", async (payload) => {
+      const recipientId = payload?.recipientId || payload?.recipient_id || payload?.userId || payload?.user_id || socket.userId;
+      const recipientType = payload?.recipientType || payload?.recipient_type || socket.recipientType || "user";
+      if (!recipientId && recipientType !== "admin") return;
+      const cnt = await NotificationService.getUnreadCountHelper({ recipientType, recipientId });
+      socket.emit("unread_count:update", { unread_count: cnt });
+    });
+
+    socket.on("get_notifications", async (payload) => {
+      const recipientId = payload?.recipientId || payload?.recipient_id || payload?.userId || payload?.user_id || socket.userId;
+      const recipientType = payload?.recipientType || payload?.recipient_type || socket.recipientType || "user";
+      const limit = Math.max(1, Math.min(100, parseInt(payload?.limit, 10) || 50));
+      const page = Math.max(1, parseInt(payload?.page, 10) || 1);
+      const isRead = payload?.isRead ?? payload?.is_read;
+      const type = payload?.type;
+      const data = await NotificationService.getNotificationsHelper({ recipientType, recipientId, isRead, type, limit, page });
+      socket.emit("notifications:list", data);
+    });
+
+    socket.on("mark_all_read", async (payload) => {
+      const recipientId = payload?.recipientId || payload?.recipient_id || payload?.userId || payload?.user_id || socket.userId;
+      const recipientType = payload?.recipientType || payload?.recipient_type || socket.recipientType || "user";
+      await NotificationService.markAllAsReadHelper({ recipientType, recipientId });
+      emitToUser(String(recipientId), "unread_count:update", { unread_count: 0 });
+      socket.emit("unread_count:update", { unread_count: 0 });
+      socket.emit("notifications:all_read", { success: true });
+    });
+
+    socket.on("mark_read", async (payload) => {
+      const notifId = payload?.id || payload?.notificationId || payload?.notification_id;
+      const recipientId = payload?.recipientId || payload?.recipient_id || payload?.userId || payload?.user_id || socket.userId;
+      const recipientType = payload?.recipientType || payload?.recipient_type || socket.recipientType || "user";
+      if (notifId) {
+        await NotificationService.markAsReadHelper(notifId);
+        const cnt = await NotificationService.getUnreadCountHelper({ recipientType, recipientId });
+        emitToUser(String(recipientId), "unread_count:update", { unread_count: cnt });
+        socket.emit("unread_count:update", { unread_count: cnt });
+        socket.emit("notification:read_confirmed", { id: notifId, unread_count: cnt });
+      }
     });
 
     // Explicit Admin join event

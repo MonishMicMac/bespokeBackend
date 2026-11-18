@@ -138,6 +138,9 @@ class NotificationService {
             } else if (type === "support" || type === "chat") {
               emitToAdmin("support_notification:new", enrichedPayload);
             }
+            NotificationService.getUnreadCountHelper({ recipientType: "admin" }).then((cnt) => {
+              emitToAdmin("unread_count:update", { unread_count: cnt });
+            }).catch(() => {});
           } else if (cleanRecipType === "vendor" && cleanRecipId) {
             emitToVendor(cleanRecipId, "vendor-notification", enrichedPayload);
             emitToVendor(cleanRecipId, "notification:new", enrichedPayload);
@@ -145,12 +148,18 @@ class NotificationService {
             if (type === "order") {
               emitToVendor(cleanRecipId, "order-notification", enrichedPayload);
             }
+            NotificationService.getUnreadCountHelper({ recipientType: "vendor", recipientId: cleanRecipId }).then((cnt) => {
+              emitToVendor(cleanRecipId, "unread_count:update", { unread_count: cnt });
+            }).catch(() => {});
           } else if (cleanRecipId) {
             emitToUser(cleanRecipId, "notification:new", enrichedPayload);
             emitToUser(cleanRecipId, "notification", enrichedPayload);
             if (type === "support" || type === "chat") {
               emitToUser(cleanRecipId, "support_notification:new", enrichedPayload);
             }
+            NotificationService.getUnreadCountHelper({ recipientType: "user", recipientId: cleanRecipId }).then((cnt) => {
+              emitToUser(cleanRecipId, "unread_count:update", { unread_count: cnt });
+            }).catch(() => {});
           }
         }
 
@@ -499,6 +508,154 @@ class NotificationService {
       }
     } catch (err) {
       console.error(`❌ Failed to notify vendors for order #${order?.id}:`, err.message);
+    }
+  }
+
+  /**
+   * Helper to retrieve unread notification count directly for WebSocket emission
+   */
+  static async getUnreadCountHelper({ recipientType = "user", recipientId }) {
+    if (!recipientId && recipientType !== "admin") return 0;
+    try {
+      const whereClause = { is_read: false };
+      const cleanType = String(recipientType || "user").toLowerCase();
+      whereClause.recipient_type = cleanType;
+
+      if (cleanType === "user" && recipientId) {
+        const cleanUid = parseInt(String(recipientId).replace(/[^0-9]/g, ""), 10);
+        const possibleIds = [String(recipientId)];
+        if (cleanUid) {
+          possibleIds.push(String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`);
+        }
+        whereClause.recipient_id = { [Op.in]: Array.from(new Set(possibleIds)) };
+      } else if (recipientId) {
+        whereClause[Op.or] = [
+          { recipient_id: String(recipientId) },
+          { recipient_id: null },
+        ];
+      }
+
+      return await Notification.count({ where: whereClause });
+    } catch (e) {
+      console.warn("Notice: getUnreadCountHelper error:", e.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Helper to retrieve paginated notifications directly for WebSocket emission
+   */
+  static async getNotificationsHelper({ recipientType = "user", recipientId, isRead, type, page = 1, limit = 50 }) {
+    try {
+      const cleanType = String(recipientType || "user").toLowerCase();
+      const whereClause = {};
+
+      if (cleanType === "admin") {
+        whereClause.recipient_type = "admin";
+      } else {
+        whereClause.recipient_type = cleanType;
+        if (recipientId) {
+          if (cleanType === "user") {
+            const cleanUid = parseInt(String(recipientId).replace(/[^0-9]/g, ""), 10);
+            const possibleIds = [String(recipientId)];
+            if (cleanUid) {
+              possibleIds.push(String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`);
+            }
+            whereClause.recipient_id = { [Op.in]: Array.from(new Set(possibleIds)) };
+          } else {
+            whereClause[Op.or] = [
+              { recipient_id: String(recipientId) },
+              { recipient_id: null },
+            ];
+          }
+        }
+      }
+
+      if (isRead !== undefined && isRead !== "all" && isRead !== "") {
+        whereClause.is_read = isRead === "true" || isRead === true || isRead === "1";
+      }
+
+      if (type) {
+        whereClause.type = type;
+      }
+
+      const pageNumber = Math.max(1, parseInt(page, 10) || 1);
+      const pageSize = Math.max(1, Math.min(100, parseInt(limit, 10) || 50));
+      const offset = (pageNumber - 1) * pageSize;
+
+      const { count, rows: notifications } = await Notification.findAndCountAll({
+        where: whereClause,
+        order: [["created_at", "DESC"]],
+        limit: pageSize,
+        offset: offset,
+      });
+
+      const unreadCount = await this.getUnreadCountHelper({ recipientType: cleanType, recipientId });
+
+      return {
+        success: true,
+        data: notifications,
+        unread_count: unreadCount,
+        pagination: {
+          total: count,
+          page: pageNumber,
+          limit: pageSize,
+          total_pages: Math.ceil(count / pageSize),
+        },
+      };
+    } catch (e) {
+      console.warn("Notice: getNotificationsHelper error:", e.message);
+      return { success: false, data: [], unread_count: 0 };
+    }
+  }
+
+  /**
+   * Helper to mark all notifications as read for recipient via WebSocket
+   */
+  static async markAllAsReadHelper({ recipientType = "user", recipientId }) {
+    try {
+      const cleanType = String(recipientType || "user").toLowerCase();
+      const whereClause = { is_read: false, recipient_type: cleanType };
+
+      if (cleanType === "user" && recipientId) {
+        const cleanUid = parseInt(String(recipientId).replace(/[^0-9]/g, ""), 10);
+        const possibleIds = [String(recipientId)];
+        if (cleanUid) {
+          possibleIds.push(String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`);
+        }
+        whereClause.recipient_id = { [Op.in]: Array.from(new Set(possibleIds)) };
+      } else if (recipientId) {
+        whereClause[Op.or] = [
+          { recipient_id: String(recipientId) },
+          { recipient_id: null },
+        ];
+      }
+
+      await Notification.update(
+        { is_read: true, read_at: new Date() },
+        { where: whereClause }
+      );
+      return true;
+    } catch (e) {
+      console.warn("Notice: markAllAsReadHelper error:", e.message);
+      return false;
+    }
+  }
+
+  /**
+   * Helper to mark a single notification as read
+   */
+  static async markAsReadHelper(notificationId) {
+    try {
+      if (!notificationId) return false;
+      await Notification.update(
+        { is_read: true, read_at: new Date() },
+        { where: { id: notificationId } }
+      );
+      return true;
+    } catch (e) {
+      console.warn("Notice: markAsReadHelper error:", e.message);
+      return false;
     }
   }
 }
