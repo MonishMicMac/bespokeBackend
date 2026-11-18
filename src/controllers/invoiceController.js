@@ -1,6 +1,6 @@
 import InvoiceService from "../services/invoiceService.js";
 import { generateInvoicePdf } from "../services/invoicePdfService.js";
-import { SaleOrder, Order } from "../../models/setupAssociations.js";
+import { SaleOrder, Order, Invoice } from "../../models/setupAssociations.js";
 import { Op } from "sequelize";
 import fs from "fs";
 import path from "path";
@@ -82,6 +82,26 @@ export class InvoiceController {
    */
   static async getCustomerInvoices(req, res) {
     try {
+      const rawSaleOrder =
+        req.query.sale_order ||
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        req.query.saleOrder ||
+        req.query.sid ||
+        null;
+
+      const rawOrderId =
+        req.query.order_id ||
+        req.query.order ||
+        req.query.orderId ||
+        null;
+
+      // If queried with specific sale order or order, directly retrieve the invoice
+      if (rawSaleOrder || rawOrderId) {
+        return InvoiceController.getOrderInvoice(req, res);
+      }
+
       const userId = resolveUserId(req);
       if (!userId) {
         return res.status(401).json({
@@ -150,17 +170,180 @@ export class InvoiceController {
   }
 
   /**
+   * GET /api/customer/invoices/download?sale_order=1068
+   * Download customer invoice PDF by sale_order query parameter (or order_id / invoice_id)
+   * Dynamically resolves the invoice matching the provided sale order ID
+   */
+  static async downloadCustomerInvoiceByQuery(req, res) {
+    try {
+      const rawSaleOrder =
+        req.query.sale_order ||
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        req.query.saleOrder ||
+        req.query.sid ||
+        null;
+
+      const rawOrderId =
+        req.query.order_id ||
+        req.query.order ||
+        req.query.orderId ||
+        null;
+
+      const rawInvoiceId =
+        req.query.invoice_id ||
+        req.query.invoice ||
+        req.query.invoiceId ||
+        req.query.id ||
+        null;
+
+      const userId = resolveUserId(req);
+      const isAdmin = checkIsAdmin(req);
+
+      let targetInvoice = null;
+
+      // 1. If sale_order is provided (e.g. ?sale_order=1068 or ?sale_order=SID1068)
+      if (rawSaleOrder) {
+        const saleOrder = await resolveSaleOrder(rawSaleOrder);
+        if (!saleOrder) {
+          return res.status(404).json({
+            status: false,
+            message: `Sale order #${rawSaleOrder} not found.`,
+          });
+        }
+
+        // Verify customer authorization if userId is supplied
+        if (!isAdmin && userId && saleOrder.order?.user_id && String(saleOrder.order.user_id) !== String(userId)) {
+          return res.status(403).json({
+            status: false,
+            message: "Unauthorized access: you do not have permission to download this invoice.",
+          });
+        }
+
+        const result = await InvoiceService.getOrCreateInvoicesForOrder(saleOrder.order_id || saleOrder.order?.id);
+        if (!result.invoices || result.invoices.length === 0) {
+          return res.status(404).json({
+            status: false,
+            message: `Invoice is not available yet for sale order #${rawSaleOrder}.`,
+          });
+        }
+
+        const cleanSid = String(saleOrder.id);
+        targetInvoice = result.invoices.find((inv) => {
+          if (inv.sale_order_id && String(inv.sale_order_id) === cleanSid) return true;
+          if (inv.items && inv.items.some((item) => String(item.sale_order_id) === cleanSid)) return true;
+          return false;
+        });
+
+        if (!targetInvoice) {
+          targetInvoice = result.invoices[0];
+        }
+      }
+      // 2. If order is provided (e.g. ?order=1220 or ?order=ORD...)
+      else if (rawOrderId) {
+        const result = await InvoiceService.getOrCreateInvoicesForOrder(rawOrderId);
+        if (!result.invoices || result.invoices.length === 0) {
+          return res.status(404).json({
+            status: false,
+            message: `Invoice is not available yet for order #${rawOrderId}.`,
+          });
+        }
+
+        if (!isAdmin && userId && result.invoices[0].order?.user_id && String(result.invoices[0].order.user_id) !== String(userId)) {
+          return res.status(403).json({
+            status: false,
+            message: "Unauthorized access: you do not have permission to download this invoice.",
+          });
+        }
+
+        targetInvoice = result.invoices[0];
+      }
+      // 3. If invoice ID is provided (e.g. ?invoice_id=36)
+      else if (rawInvoiceId) {
+        targetInvoice = await InvoiceService.getInvoiceById(rawInvoiceId, { userId, isAdmin });
+      }
+      // 4. Missing required query parameter
+      else {
+        return res.status(400).json({
+          status: false,
+          message: "Please provide a sale_order parameter (e.g. /api/customer/invoices/download?sale_order=1068).",
+        });
+      }
+
+      if (!targetInvoice) {
+        return res.status(404).json({
+          status: false,
+          message: "Invoice not found.",
+        });
+      }
+
+      const sanitizedNum = (targetInvoice.invoice_number || `INV_${targetInvoice.id}`).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const filename = `BESPOKE_INV_${sanitizedNum}.pdf`;
+      const disposition = req.query.inline === "true" || req.query.view === "true" ? "inline" : "attachment";
+      const forceRegenerate = req.query.regenerate === "true" || req.query.fresh === "true";
+
+      // Check if file is cached on disk and is a valid single-page document
+      if (!forceRegenerate && targetInvoice.pdf_path && fs.existsSync(targetInvoice.pdf_path)) {
+        try {
+          const cachedBuffer = fs.readFileSync(targetInvoice.pdf_path, "latin1");
+          const pageMatches = cachedBuffer.match(/\/Type\s*\/Page[^s]/g);
+          // Only serve cached file if it is a single-page document (no stale multi-page cache)
+          if (!pageMatches || pageMatches.length <= 1) {
+            res.setHeader("Content-Type", "application/pdf");
+            res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+            res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            const fileStream = fs.createReadStream(targetInvoice.pdf_path);
+            return fileStream.pipe(res);
+          }
+        } catch (readCacheErr) {
+          // ignore error and re-generate
+        }
+      }
+
+      // Generate dynamically and save
+      const storageDir = path.resolve("./storage/invoices");
+      if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
+      const targetPath = path.join(storageDir, filename);
+
+      const buffer = await generateInvoicePdf(targetInvoice, targetPath);
+      try {
+        await Invoice.update({ pdf_path: targetPath }, { where: { id: targetInvoice.id } });
+      } catch (saveErr) {
+        // ignore notice
+      }
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      return res.send(buffer);
+    } catch (err) {
+      console.error("Error in downloadCustomerInvoiceByQuery:", err);
+      const statusCode = err.message.includes("Unauthorized") ? 403 : 500;
+      return res.status(statusCode).json({
+        status: false,
+        message: err.message || "Unable to download invoice PDF.",
+      });
+    }
+  }
+
+  /**
    * 3. GET /api/customer/invoices/:invoiceId/download
    * Download Invoice PDF
    */
   static async downloadInvoicePdf(req, res) {
     try {
       const { invoiceId } = req.params;
+      if (invoiceId === "download" || !invoiceId || isNaN(parseInt(invoiceId, 10))) {
+        return InvoiceController.downloadCustomerInvoiceByQuery(req, res);
+      }
+
       const userId = resolveUserId(req);
       const vendorId = resolveVendorId(req);
       const isAdmin = checkIsAdmin(req);
       const saleOrderId =
         req.query.sale_order_id ||
+        req.query.sale_order ||
         req.query.sale_id ||
         req.query.saleOrderId ||
         null;
@@ -211,13 +394,28 @@ export class InvoiceController {
   static async getOrderInvoice(req, res) {
     try {
       let orderId = req.params.orderId || req.params.saleOrderId;
+      if (orderId === "invoice" || orderId === "invoices") {
+        orderId = null;
+      }
+
       const rawSaleOrderId =
+        req.query.sale_order ||
         req.query.sale_order_id ||
         req.query.sale_id ||
         req.query.saleOrderId ||
+        req.query.saleOrder ||
+        req.query.sid ||
         req.params.saleOrderId ||
         req.body?.sale_order_id ||
         null;
+
+      const rawOrderId =
+        req.query.order_id ||
+        req.query.order ||
+        req.query.orderId ||
+        orderId ||
+        null;
+
       const userId = resolveUserId(req);
 
       let saleOrder = null;
@@ -227,11 +425,13 @@ export class InvoiceController {
 
       if (saleOrder && saleOrder.order) {
         orderId = saleOrder.order.order_id || saleOrder.order.id;
-      } else if (orderId && String(orderId).toUpperCase().startsWith("SID") && !saleOrder) {
-        saleOrder = await resolveSaleOrder(orderId);
+      } else if (rawOrderId && String(rawOrderId).toUpperCase().startsWith("SID") && !saleOrder) {
+        saleOrder = await resolveSaleOrder(rawOrderId);
         if (saleOrder && saleOrder.order) {
           orderId = saleOrder.order.order_id || saleOrder.order.id;
         }
+      } else if (rawOrderId) {
+        orderId = rawOrderId;
       }
 
       const result = await InvoiceService.getOrCreateInvoicesForOrder(orderId || saleOrder?.order_id);

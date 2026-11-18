@@ -9,6 +9,17 @@ const router = express.Router();
 // List authenticated customer's invoices (history)
 router.get("/customer/invoices", InvoiceController.getCustomerInvoices);
 
+// Download customer invoice PDF by query parameter (e.g. /api/customer/invoices/download?sale_order=1068)
+router.get("/customer/invoices/download", InvoiceController.downloadCustomerInvoiceByQuery);
+router.get("/invoices/download", InvoiceController.downloadCustomerInvoiceByQuery);
+
+// Fetch order / sale-order invoice directly without path parameter (e.g. /api/customer/orders/invoice?sale_order_id=1068)
+router.get("/customer/orders/invoice", InvoiceController.getOrderInvoice);
+router.get("/customer/orders/invoices", InvoiceController.getOrderInvoice);
+router.get("/customer/orders/invoice/download", InvoiceController.downloadCustomerInvoiceByQuery);
+router.get("/customer/sale-orders/invoice", InvoiceController.getOrderInvoice);
+router.get("/customer/sale-orders/invoice/download", InvoiceController.downloadCustomerInvoiceByQuery);
+
 // Retrieve invoice details by invoice ID
 router.get("/customer/invoices/:invoiceId", InvoiceController.getInvoiceDetails);
 
@@ -49,8 +60,12 @@ router.get("/vendor/invoices/:invoiceId/download", InvoiceController.downloadInv
 // ==========================================
 router.get("/invoices/:invoiceId", InvoiceController.getInvoiceDetails);
 router.get("/invoices/:invoiceId/download", InvoiceController.downloadInvoicePdf);
+router.get("/orders/invoice", InvoiceController.getOrderInvoice);
+router.get("/orders/invoice/download", InvoiceController.downloadCustomerInvoiceByQuery);
 router.get("/orders/:orderId/invoice", InvoiceController.getOrderInvoice);
 router.get("/orders/:orderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
+router.get("/sale-orders/invoice", InvoiceController.getOrderInvoice);
+router.get("/sale-orders/invoice/download", InvoiceController.downloadCustomerInvoiceByQuery);
 router.get("/sale-orders/:saleOrderId/invoice", InvoiceController.getOrderInvoice);
 router.get("/sale-orders/:saleOrderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
 
