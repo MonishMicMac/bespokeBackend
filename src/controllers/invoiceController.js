@@ -1,13 +1,45 @@
 import InvoiceService from "../services/invoiceService.js";
 import { generateInvoicePdf } from "../services/invoicePdfService.js";
+import { SaleOrder, Order } from "../../models/setupAssociations.js";
+import { Op } from "sequelize";
 import fs from "fs";
 import path from "path";
+
+/**
+ * Resolves SaleOrder from numeric id or sale_id code (e.g. 1065 or 'SID1065')
+ */
+async function resolveSaleOrder(rawSaleOrderId) {
+  if (!rawSaleOrderId) return null;
+  const str = String(rawSaleOrderId).trim();
+  const isNum = /^\d+$/.test(str);
+  const cleanId = isNum ? parseInt(str, 10) : -1;
+  const rawClean = str.replace(/^SID/i, "");
+  const numClean = /^\d+$/.test(rawClean) ? parseInt(rawClean, 10) : -1;
+
+  try {
+    return await SaleOrder.findOne({
+      where: {
+        [Op.or]: [
+          { id: cleanId > 0 ? cleanId : -1 },
+          { id: numClean > 0 ? numClean : -1 },
+          { sale_id: str },
+          { sale_id: `SID${str}` },
+          { sale_id: `SID${rawClean}` },
+        ],
+      },
+      include: [{ association: "order" }],
+    });
+  } catch (err) {
+    console.warn("Could not resolve sale_order:", err.message);
+    return null;
+  }
+}
 
 /**
  * Resolves current user ID from headers, auth token or query/body
  */
 function resolveUserId(req) {
-  return (
+  const raw = (
     req.user?.id ||
     req.user?.user_id ||
     req.headers["x-user-id"] ||
@@ -15,6 +47,10 @@ function resolveUserId(req) {
     req.body?.user_id ||
     null
   );
+  if (!raw || typeof raw === "object" || raw === "[object Object]" || raw === "undefined" || raw === "null") {
+    return null;
+  }
+  return raw;
 }
 
 /**
@@ -86,10 +122,16 @@ export class InvoiceController {
       const userId = resolveUserId(req);
       const vendorId = resolveVendorId(req);
       const isAdmin = checkIsAdmin(req);
+      const saleOrderId =
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        null;
 
       const invoice = await InvoiceService.getInvoiceById(invoiceId, {
         userId,
         vendorId,
+        saleOrderId,
         isAdmin,
       });
 
@@ -117,10 +159,16 @@ export class InvoiceController {
       const userId = resolveUserId(req);
       const vendorId = resolveVendorId(req);
       const isAdmin = checkIsAdmin(req);
+      const saleOrderId =
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        null;
 
       const invoice = await InvoiceService.getInvoiceById(invoiceId, {
         userId,
         vendorId,
+        saleOrderId,
         isAdmin,
       });
 
@@ -158,16 +206,37 @@ export class InvoiceController {
 
   /**
    * 4. GET /api/customer/orders/:orderId/invoice
-   * Retrieve or create invoices for a specific order
+   * Retrieve or create invoices for a specific order or sale order
    */
   static async getOrderInvoice(req, res) {
     try {
-      const { orderId } = req.params;
+      let orderId = req.params.orderId || req.params.saleOrderId;
+      const rawSaleOrderId =
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        req.params.saleOrderId ||
+        req.body?.sale_order_id ||
+        null;
       const userId = resolveUserId(req);
 
-      const result = await InvoiceService.getOrCreateInvoicesForOrder(orderId);
+      let saleOrder = null;
+      if (rawSaleOrderId) {
+        saleOrder = await resolveSaleOrder(rawSaleOrderId);
+      }
 
-      // Verify customer authorization
+      if (saleOrder && saleOrder.order) {
+        orderId = saleOrder.order.order_id || saleOrder.order.id;
+      } else if (orderId && String(orderId).toUpperCase().startsWith("SID") && !saleOrder) {
+        saleOrder = await resolveSaleOrder(orderId);
+        if (saleOrder && saleOrder.order) {
+          orderId = saleOrder.order.order_id || saleOrder.order.id;
+        }
+      }
+
+      const result = await InvoiceService.getOrCreateInvoicesForOrder(orderId || saleOrder?.order_id);
+
+      // Verify customer authorization if userId provided
       if (userId && result.invoices && result.invoices.length > 0) {
         const orderUid = result.invoices[0].order?.user_id;
         if (orderUid && String(orderUid) !== String(userId)) {
@@ -178,12 +247,30 @@ export class InvoiceController {
         }
       }
 
+      // If a specific sale order was requested, find the matching invoice
+      let matchingInvoice = null;
+      if (saleOrder && result.invoices && result.invoices.length > 0) {
+        matchingInvoice = result.invoices.find((inv) => {
+          if (inv.sale_order_id && String(inv.sale_order_id) === String(saleOrder.id)) return true;
+          if (inv.items && inv.items.some((item) => String(item.sale_order_id) === String(saleOrder.id))) return true;
+          return false;
+        });
+      }
+
+      if (!matchingInvoice && result.invoices && result.invoices.length > 0) {
+        matchingInvoice = result.invoices[0];
+      }
+
       return res.status(200).json({
         status: true,
         ...result,
+        sale_order_id: saleOrder ? saleOrder.id : (matchingInvoice?.sale_order_id || null),
+        sale_id: saleOrder?.sale_id || (saleOrder?.id ? `SID${saleOrder.id}` : null),
+        invoice: matchingInvoice || null,
+        invoices: matchingInvoice ? [matchingInvoice] : result.invoices,
       });
     } catch (err) {
-      console.error(`Error in getOrderInvoice (${req.params?.orderId}):`, err);
+      console.error(`Error in getOrderInvoice (${req.params?.orderId || req.query?.sale_order_id}):`, err);
       return res.status(500).json({
         status: false,
         message: err.message || "Unable to retrieve invoice for order.",
@@ -193,15 +280,35 @@ export class InvoiceController {
 
   /**
    * 5. GET /api/customer/orders/:orderId/invoice/download
-   * Download primary or first invoice PDF for order
+   * Download primary or first invoice PDF for order / sale order
    */
   static async downloadOrderInvoicePdf(req, res) {
     try {
-      const { orderId } = req.params;
+      let orderId = req.params.orderId || req.params.saleOrderId;
       const sellerId = req.query.seller_id || req.query.vendor_id || null;
+      const rawSaleOrderId =
+        req.query.sale_order_id ||
+        req.query.sale_id ||
+        req.query.saleOrderId ||
+        req.params.saleOrderId ||
+        req.body?.sale_order_id ||
+        null;
       const userId = resolveUserId(req);
 
-      const result = await InvoiceService.getOrCreateInvoicesForOrder(orderId);
+      let saleOrder = null;
+      if (rawSaleOrderId) {
+        saleOrder = await resolveSaleOrder(rawSaleOrderId);
+      }
+      if (saleOrder && saleOrder.order) {
+        orderId = saleOrder.order.order_id || saleOrder.order.id;
+      } else if (orderId && String(orderId).toUpperCase().startsWith("SID") && !saleOrder) {
+        saleOrder = await resolveSaleOrder(orderId);
+        if (saleOrder && saleOrder.order) {
+          orderId = saleOrder.order.order_id || saleOrder.order.id;
+        }
+      }
+
+      const result = await InvoiceService.getOrCreateInvoicesForOrder(orderId || saleOrder?.order_id);
 
       if (!result.invoices || result.invoices.length === 0) {
         return res.status(404).json({
@@ -220,7 +327,15 @@ export class InvoiceController {
       }
 
       let selectedInvoice = result.invoices[0];
-      if (sellerId) {
+
+      if (saleOrder) {
+        const bySaleOrder = result.invoices.find((inv) => {
+          if (inv.sale_order_id && String(inv.sale_order_id) === String(saleOrder.id)) return true;
+          if (inv.items && inv.items.some((item) => String(item.sale_order_id) === String(saleOrder.id))) return true;
+          return false;
+        });
+        if (bySaleOrder) selectedInvoice = bySaleOrder;
+      } else if (sellerId) {
         const match = result.invoices.find((inv) => String(inv.seller_id) === String(sellerId));
         if (match) selectedInvoice = match;
       }

@@ -1,5 +1,7 @@
 import Notification from "../../models/Notification.js";
 import TicketMessage from "../../models/TicketMessage.js";
+import Message from "../../models/index.js";
+import sequelize from "../../config/db.js";
 import { Op } from "sequelize";
 import { emitToVendor, emitToAdmin, emitToUser } from "../sockets/socket.js";
 import NotificationService from "../services/notificationService.js";
@@ -108,7 +110,53 @@ export const getUnreadCount = async (req, res) => {
     }
     if (targetRecipientId) {
       if (targetRecipientType === "user") {
-        whereClause.recipient_id = String(targetRecipientId);
+        const cleanUid = parseInt(String(targetRecipientId).replace(/[^0-9]/g, ""), 10);
+        const possibleIds = [String(targetRecipientId)];
+        if (cleanUid) {
+          possibleIds.push(String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`);
+        }
+        whereClause.recipient_id = { [Op.in]: Array.from(new Set(possibleIds)) };
+
+        // Reconcile stale support/chat notifications against actual unseen messages
+        if (cleanUid) {
+          try {
+            const unreadSupportNotifs = await Notification.findAll({
+              where: {
+                recipient_type: "user",
+                recipient_id: { [Op.in]: Array.from(new Set(possibleIds)) },
+                type: { [Op.in]: ["support", "chat"] },
+                is_read: false,
+              },
+            });
+
+            if (unreadSupportNotifs.length > 0) {
+              const [unseenRow] = await sequelize.query(
+                `SELECT COUNT(*) as unseen_count FROM ticket_messages 
+                 WHERE receiver_id = :uid AND seen_at IS NULL`,
+                { replacements: { uid: cleanUid } }
+              );
+              const unseenCount = Number(unseenRow?.[0]?.unseen_count) || 0;
+
+              for (const notif of unreadSupportNotifs) {
+                // If the user has 0 unseen support messages across all tickets, mark support notif as read
+                if (unseenCount === 0) {
+                  notif.is_read = true;
+                  notif.read_at = notif.read_at || new Date();
+                  await notif.save();
+                } else if (notif.related_message_id) {
+                  const tMsg = await TicketMessage.findByPk(notif.related_message_id);
+                  if (tMsg && tMsg.seen_at) {
+                    notif.is_read = true;
+                    notif.read_at = tMsg.seen_at;
+                    await notif.save();
+                  }
+                }
+              }
+            }
+          } catch (healErr) {
+            console.warn("Notice: support notification sync error:", healErr.message);
+          }
+        }
       } else {
         whereClause[Op.or] = [
           { recipient_id: String(targetRecipientId) },
@@ -193,9 +241,15 @@ export const markAllNotificationsRead = async (req, res) => {
     if (targetRecipientType) {
       whereClause.recipient_type = targetRecipientType;
     }
+    let cleanUid = null;
     if (targetRecipientId) {
       if (targetRecipientType === "user") {
-        whereClause.recipient_id = String(targetRecipientId);
+        cleanUid = parseInt(String(targetRecipientId).replace(/[^0-9]/g, ""), 10);
+        const possibleIds = [String(targetRecipientId)];
+        if (cleanUid) {
+          possibleIds.push(String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`);
+        }
+        whereClause.recipient_id = { [Op.in]: Array.from(new Set(possibleIds)) };
       } else {
         whereClause[Op.or] = [
           { recipient_id: String(targetRecipientId) },
@@ -212,20 +266,29 @@ export const markAllNotificationsRead = async (req, res) => {
       { where: whereClause }
     );
 
-    // Also mark ticket_messages as seen for this user
-    if (targetRecipientType === "user" && targetRecipientId) {
-      const cleanUid = parseInt(String(targetRecipientId).replace(/[^0-9]/g, ""), 10);
-      if (cleanUid) {
-        await TicketMessage.update(
-          { seen_at: new Date() },
-          {
-            where: {
-              receiver_id: cleanUid,
-              seen_at: null,
-            },
-          }
-        ).catch(() => {});
-      }
+    // Also mark ticket_messages as seen and Message as read for this user
+    if (targetRecipientType === "user" && cleanUid) {
+      await TicketMessage.update(
+        { seen_at: new Date() },
+        {
+          where: {
+            receiver_id: cleanUid,
+            seen_at: null,
+          },
+        }
+      ).catch(() => {});
+
+      await Message.update(
+        { isRead: true, status: "read" },
+        {
+          where: {
+            receiverId: { [Op.in]: [String(cleanUid), `customer_${cleanUid}`, `user_${cleanUid}`] },
+            isRead: false,
+          },
+        }
+      ).catch(() => {});
+
+      emitToUser(String(cleanUid), "unread_count:update", { unread_count: 0 });
     }
 
     return res.status(200).json({

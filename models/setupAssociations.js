@@ -45,6 +45,7 @@ import OrderAddon from "./OrderAddon.js";
 import Invoice from "./Invoice.js";
 import InvoiceItem from "./InvoiceItem.js";
 import InvoiceAdjustment from "./InvoiceAdjustment.js";
+import GstMaster from "./GstMaster.js";
 
 let associationsInitialized = false;
 
@@ -267,4 +268,5 @@ export {
   Invoice,
   InvoiceItem,
   InvoiceAdjustment,
+  GstMaster,
 };

@@ -49,6 +49,10 @@ const ProductMaterial = sequelize.define(
       type: DataTypes.ENUM("0", "1"),
       defaultValue: "1",
     },
+    gst_id: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: true,

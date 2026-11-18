@@ -198,6 +198,41 @@ export class InvoiceService {
       });
     }
 
+    // Fallback: Check if orderIdentifier is a sale_order_id (e.g. 1065 or 'SID1065')
+    if (!order) {
+      const rawStr = String(orderIdentifier).trim();
+      const rawClean = rawStr.replace(/^SID/i, "");
+      const isSidNum = /^\d+$/.test(rawClean);
+      try {
+        const so = await SaleOrder.findOne({
+          where: {
+            [Op.or]: [
+              { id: isNumeric ? parseInt(orderIdentifier, 10) : -1 },
+              { id: isSidNum ? parseInt(rawClean, 10) : -1 },
+              { sale_id: rawStr },
+              { sale_id: `SID${rawStr}` },
+              { sale_id: `SID${rawClean}` },
+            ],
+          },
+          include: [
+            {
+              association: "order",
+              include: [
+                { association: "user" },
+                { association: "address" },
+                { association: "promocode" },
+              ],
+            },
+          ],
+        });
+        if (so && so.order) {
+          order = so.order;
+        }
+      } catch (soErr) {
+        // continue
+      }
+    }
+
     if (!order) {
       throw new Error(`Order #${orderIdentifier} not found.`);
     }
@@ -232,29 +267,43 @@ export class InvoiceService {
         order: [["id", "ASC"]],
       });
 
-      if (existingInvoices && existingInvoices.length > 0 && !force) {
-        // Verify PDFs exist on disk for each invoice
-        for (const inv of existingInvoices) {
-          if (!inv.pdf_path || !fs.existsSync(inv.pdf_path)) {
-            try {
-              const sanitizedNum = inv.invoice_number.replace(/[^a-zA-Z0-9_-]/g, "_");
-              const storageDir = path.resolve("./storage/invoices");
-              if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
-              const pdfTarget = path.join(storageDir, `BESPOKE_INV_${sanitizedNum}.pdf`);
-              await generateInvoicePdf(inv, pdfTarget);
-              await inv.update({ pdf_path: pdfTarget });
-            } catch (pdfErr) {
-              console.warn("Notice ensuring cached invoice PDF:", pdfErr.message);
+      if (existingInvoices && existingInvoices.length > 0) {
+        const orderPayable = parseFloat(order.payable_price || 0);
+        const hasMismatchWithOrder =
+          orderPayable > 0 &&
+          existingInvoices.some((inv) => Math.abs(parseFloat(inv.grand_total) - orderPayable) > 0.5);
+
+        if (!force && !hasMismatchWithOrder) {
+          // Verify PDFs exist on disk for each invoice
+          for (const inv of existingInvoices) {
+            if (!inv.pdf_path || !fs.existsSync(inv.pdf_path)) {
+              try {
+                const sanitizedNum = inv.invoice_number.replace(/[^a-zA-Z0-9_-]/g, "_");
+                const storageDir = path.resolve("./storage/invoices");
+                if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
+                const pdfTarget = path.join(storageDir, `BESPOKE_INV_${sanitizedNum}.pdf`);
+                await generateInvoicePdf(inv, pdfTarget);
+                await inv.update({ pdf_path: pdfTarget });
+              } catch (pdfErr) {
+                console.warn("Notice ensuring cached invoice PDF:", pdfErr.message);
+              }
             }
           }
-        }
 
-        return {
-          eligible: true,
-          status: "ISSUED",
-          orderId: cleanOrderId,
-          invoices: existingInvoices,
-        };
+          return {
+            eligible: true,
+            status: "ISSUED",
+            orderId: cleanOrderId,
+            invoices: existingInvoices.map((inv) => formatInvoiceWithClientBreakdown(inv)),
+          };
+        } else {
+          // Force regeneration: remove prior records to avoid unique constraint violations
+          for (const oldInv of existingInvoices) {
+            await InvoiceItem.destroy({ where: { invoice_id: oldInv.id } });
+            await InvoiceAdjustment.destroy({ where: { invoice_id: oldInv.id } });
+            await oldInv.destroy();
+          }
+        }
       }
 
       // 4. Fetch all sale_orders (garments) for this checkout order
@@ -424,7 +473,7 @@ export class InvoiceService {
           const invoiceNumber = await this.generateInvoiceNumber(financialYear);
 
           // Calculate Item totals
-          let groupSubtotal = 0;
+          let groupBasicPrice = 0;
           let groupDiscount = 0;
           let groupTaxable = 0;
           let groupCgst = 0;
@@ -446,16 +495,74 @@ export class InvoiceService {
 
             const netLineTotal = Math.max(0, rawLineTotal - itemDisc);
 
-            // GST Rate for apparel: 12% standard, or 5% if <= 1000 per piece
-            let gstRate = 12.0;
-            if (unitPrice <= 1000) {
-              gstRate = 5.0;
+            // Look up product_prices for actual MRP / Basic Price and GST
+            let basicUnitPrice = unitPrice;
+            let gstRate = unitPrice <= 1000 ? 5.0 : 12.0;
+
+            if (so.price_id) {
+              try {
+                const [priceGstRows] = await sequelize.query(
+                  `SELECT pp.actual_price, pp.discount_price,
+                          COALESCE(pp.gst_id, pm.gst_id, p.gst_id) AS resolved_gst_id,
+                          gm.gst_name, gm.rate AS gst_rate, gm.gst_percentage
+                   FROM product_prices pp
+                   LEFT JOIN products p ON pp.product_id = p.id
+                   LEFT JOIN product_materials pm ON pp.material_id = pm.id
+                   LEFT JOIN gst_masters gm ON COALESCE(pp.gst_id, pm.gst_id, p.gst_id) = gm.id AND (gm.action IS NULL OR gm.action != '1')
+                   WHERE pp.id = ? LIMIT 1`,
+                  { replacements: [so.price_id], transaction }
+                );
+                if (priceGstRows && priceGstRows.length > 0) {
+                  const pRow = priceGstRows[0];
+                  if (pRow.actual_price && parseFloat(pRow.actual_price) > 0) {
+                    basicUnitPrice = parseFloat(pRow.actual_price);
+                  }
+                  if (pRow.gst_percentage != null) {
+                    const parsedPct = parseFloat(pRow.gst_percentage);
+                    if (!isNaN(parsedPct) && parsedPct > 0) {
+                      gstRate = parsedPct;
+                    }
+                  }
+                }
+              } catch (e) {
+                // fallback to default
+              }
             }
 
-            // Taxable Value calculation from tax-inclusive price:
-            // Taxable = NetLineTotal / (1 + (gstRate / 100))
-            const lineTaxable = Number((netLineTotal / (1 + gstRate / 100)).toFixed(2));
-            const lineTotalTax = Number((netLineTotal - lineTaxable).toFixed(2));
+            if (basicUnitPrice < unitPrice) {
+              basicUnitPrice = unitPrice;
+            }
+
+            // Basic Price (MRP)
+            const lineBasicTotal = Number((basicUnitPrice * qty).toFixed(2));
+
+            // Check whether order was charged with GST added on top of netLineTotal or inclusive
+            const orderProductPrice = parseFloat(order.price || 0);
+            const orderPayablePrice = parseFloat(order.payable_price || 0);
+            const orderDelivery = parseFloat(order.delivery_amount || 0);
+            const couponDisc = parseFloat(order.discount_amt || 0);
+
+            const expectedGstOnTop = Number(((netLineTotal * gstRate) / 100).toFixed(2));
+            const isGstAddedOnTop =
+              (orderProductPrice > 0 && Math.abs(orderProductPrice - (netLineTotal + expectedGstOnTop)) < 1.0) ||
+              (orderPayablePrice > 0 && Math.abs(orderPayablePrice - (netLineTotal + expectedGstOnTop + orderDelivery - couponDisc)) < 1.0);
+
+            let lineTaxable = 0;
+            let lineTotalTax = 0;
+            let lineTotalAmount = 0;
+
+            if (isGstAddedOnTop) {
+              lineTaxable = Number(netLineTotal.toFixed(2));
+              lineTotalTax = expectedGstOnTop;
+              lineTotalAmount = Number((lineTaxable + lineTotalTax).toFixed(2));
+            } else {
+              // Backward-compatible for legacy orders where netLineTotal was inclusive
+              lineTaxable = Number((netLineTotal / (1 + gstRate / 100)).toFixed(2));
+              lineTotalTax = Number((netLineTotal - lineTaxable).toFixed(2));
+              lineTotalAmount = Number(netLineTotal.toFixed(2));
+            }
+
+            const lineDiscount = Math.max(0, Number((lineBasicTotal - lineTaxable).toFixed(2)));
 
             let lineCgst = 0;
             let lineSgst = 0;
@@ -486,18 +593,18 @@ export class InvoiceService {
               variant_snapshot: variantParts.join(" | ") || "Bespoke Size",
               customization_details: so.measurment_details || null,
               quantity: qty,
-              unit_price: Number(unitPrice.toFixed(2)),
-              discount_amount: Number(itemDisc.toFixed(2)),
+              unit_price: Number(basicUnitPrice.toFixed(2)),
+              discount_amount: lineDiscount,
               taxable_amount: lineTaxable,
               gst_rate: gstRate,
               cgst_amount: lineCgst,
               sgst_amount: lineSgst,
               igst_amount: lineIgst,
-              total_amount: Number(netLineTotal.toFixed(2)),
+              total_amount: Number(lineTotalAmount.toFixed(2)),
             });
 
-            groupSubtotal += rawLineTotal;
-            groupDiscount += itemDisc;
+            groupBasicPrice += lineBasicTotal;
+            groupDiscount += lineDiscount;
             groupTaxable += lineTaxable;
             groupCgst += lineCgst;
             groupSgst += lineSgst;
@@ -506,17 +613,29 @@ export class InvoiceService {
 
           // Coupon proportion
           const totalOrderPrice = parseFloat(order.price || 1);
-          const sellerRatio = Math.min(1, Math.max(0, groupSubtotal / (totalOrderPrice || 1)));
+          const sellerRatio = Math.min(1, Math.max(0, (groupBasicPrice || 1) / (totalOrderPrice || 1)));
           const totalCouponDiscount = parseFloat(order.discount_amt || 0);
           const couponDiscountShare = Number((totalCouponDiscount * sellerRatio).toFixed(2));
 
-          // Delivery charges
+          // Packing & Delivery charges with 18% GST standard (e.g. Total 100 -> Base 85, GST 15)
           const totalDelivery = parseFloat(order.delivery_amount || 0);
           const deliveryShare = Number((totalDelivery * sellerRatio).toFixed(2));
+          const pndGstRate = 18.0;
+          let baseShipping = 0;
+          let shippingTax = 0;
 
-          const calculatedGrandTotal = Number(
-            (groupSubtotal - groupDiscount - couponDiscountShare + deliveryShare).toFixed(2)
+          if (deliveryShare > 0) {
+            baseShipping = Number((deliveryShare / (1 + pndGstRate / 100)).toFixed(2));
+            shippingTax = Number((deliveryShare - baseShipping).toFixed(2));
+          }
+
+          let calculatedGrandTotal = Number(
+            (groupTaxable + groupCgst + groupSgst + groupIgst + baseShipping + shippingTax - couponDiscountShare).toFixed(2)
           );
+          const orderPayablePrice = parseFloat(order.payable_price || 0);
+          if (orderPayablePrice > 0 && Math.abs(calculatedGrandTotal - orderPayablePrice) < 1.0) {
+            calculatedGrandTotal = orderPayablePrice;
+          }
 
           // Payment details
           const payMethod = order.transaction_id === "COD" ? "Cash on Delivery" : "Razorpay Online";
@@ -557,15 +676,15 @@ export class InvoiceService {
               payment_status: payStatus,
               payment_date: order.payment_time || orderDate,
 
-              subtotal: Number(groupSubtotal.toFixed(2)),
+              subtotal: Number(groupBasicPrice.toFixed(2)),
               discount_amount: Number(groupDiscount.toFixed(2)),
               coupon_discount: couponDiscountShare,
               taxable_amount: Number(groupTaxable.toFixed(2)),
               cgst_amount: Number(groupCgst.toFixed(2)),
               sgst_amount: Number(groupSgst.toFixed(2)),
               igst_amount: Number(groupIgst.toFixed(2)),
-              shipping_amount: deliveryShare,
-              shipping_tax_amount: 0.0,
+              shipping_amount: baseShipping,
+              shipping_tax_amount: shippingTax,
               rounding_amount: 0.0,
               grand_total: calculatedGrandTotal,
               refund_amount: 0.0,
@@ -618,7 +737,7 @@ export class InvoiceService {
         eligible: true,
         status: "ISSUED",
         orderId: cleanOrderId,
-        invoices: createdInvoices,
+        invoices: createdInvoices.map((inv) => formatInvoiceWithClientBreakdown(inv)),
       };
     })();
 
@@ -633,7 +752,7 @@ export class InvoiceService {
   /**
    * Retrieves single invoice by ID with strict ownership validation
    */
-  static async getInvoiceById(invoiceId, { userId = null, vendorId = null, isAdmin = false } = {}) {
+  static async getInvoiceById(invoiceId, { userId = null, vendorId = null, saleOrderId = null, isAdmin = false } = {}) {
     const cleanId = parseInt(invoiceId, 10);
     if (!cleanId || isNaN(cleanId)) {
       throw new Error("Invalid invoice ID.");
@@ -653,7 +772,16 @@ export class InvoiceService {
 
     // Authorization checks
     if (!isAdmin) {
-      if (userId && String(invoice.order?.user_id) !== String(userId)) {
+      const cleanUid = userId && String(userId) !== "[object Object]" ? String(userId) : null;
+      if (saleOrderId) {
+        const cleanSid = String(saleOrderId).replace(/^SID/i, "");
+        const matchesSaleOrder =
+          String(invoice.sale_order_id) === String(cleanSid) ||
+          (invoice.items && invoice.items.some((i) => String(i.sale_order_id) === String(cleanSid)));
+        if (!matchesSaleOrder && cleanUid && String(invoice.order?.user_id) !== cleanUid) {
+          throw new Error("Unauthorized access: you do not have permission to view this invoice.");
+        }
+      } else if (cleanUid && String(invoice.order?.user_id) !== cleanUid) {
         throw new Error("Unauthorized access: you do not have permission to view this invoice.");
       }
       if (vendorId && String(invoice.seller_id) !== String(vendorId)) {
@@ -661,7 +789,23 @@ export class InvoiceService {
       }
     }
 
-    return invoice;
+    // Check if invoice grand_total mismatches order payable_price
+    if (invoice.order?.payable_price) {
+      const orderPayable = parseFloat(invoice.order.payable_price);
+      if (orderPayable > 0 && Math.abs(parseFloat(invoice.grand_total) - orderPayable) > 0.5) {
+        try {
+          const refreshed = await this.getOrCreateInvoicesForOrder(invoice.order_id, { force: true });
+          if (refreshed?.invoices?.length > 0) {
+            const matched = refreshed.invoices.find((i) => i.id === cleanId) || refreshed.invoices[0];
+            return matched;
+          }
+        } catch (syncErr) {
+          console.warn("Notice syncing invoice to order payable:", syncErr.message);
+        }
+      }
+    }
+
+    return formatInvoiceWithClientBreakdown(invoice);
   }
 
   /**
@@ -716,7 +860,7 @@ export class InvoiceService {
       page: p,
       limit: lim,
       totalPages: Math.ceil(count / lim),
-      invoices: rows,
+      invoices: rows.map((inv) => formatInvoiceWithClientBreakdown(inv)),
     };
   }
 
@@ -778,6 +922,85 @@ export class InvoiceService {
 
     return creditNote;
   }
+}
+
+/**
+ * Attaches the exact client invoice calculation breakdown:
+ * - Basic Price (MRP)
+ * - Discount (-XX%)
+ * - GST (XX%)
+ * - Total (Product Total)
+ * - Packing and Delivery charges
+ * - GST on P&D 18%
+ * - Final payable
+ */
+export function formatInvoiceWithClientBreakdown(invoice) {
+  if (!invoice) return null;
+  const inv = typeof invoice.toJSON === "function" ? invoice.toJSON() : { ...invoice };
+
+  let basicPrice = Number(inv.subtotal || 0);
+  let discountAmount = Number(inv.discount_amount || 0);
+  let couponDiscount = Number(inv.coupon_discount || 0);
+  let totalDiscount = Number((discountAmount + couponDiscount).toFixed(2));
+  let taxableAmount = Number(inv.taxable_amount || 0);
+  let cgst = Number(inv.cgst_amount || 0);
+  let sgst = Number(inv.sgst_amount || 0);
+  let igst = Number(inv.igst_amount || 0);
+  let productGst = Number((cgst + sgst + igst).toFixed(2));
+  let shippingAmount = Number(inv.shipping_amount || 0);
+  let shippingTax = Number(inv.shipping_tax_amount || 0);
+  let grandTotal = Number(inv.grand_total || 0);
+
+  // Synchronize grandTotal with order payable_price if available
+  if (inv.order?.payable_price) {
+    const orderPayable = Number(inv.order.payable_price);
+    if (orderPayable > 0 && Math.abs(grandTotal - orderPayable) > 0.5) {
+      grandTotal = orderPayable;
+    }
+  }
+
+  // Fallback for older invoice records where shipping_tax_amount was 0
+  if (shippingTax === 0 && shippingAmount > 0) {
+    const pndBase = Number((shippingAmount / 1.18).toFixed(2));
+    const pndTax = Number((shippingAmount - pndBase).toFixed(2));
+    shippingAmount = pndBase;
+    shippingTax = pndTax;
+  }
+
+  if (basicPrice === 0 || basicPrice < taxableAmount) {
+    basicPrice = Number((taxableAmount + totalDiscount).toFixed(2));
+  }
+
+  const productTotal = Number((taxableAmount + productGst).toFixed(2));
+  const finalPayable = grandTotal > 0 ? grandTotal : Number((productTotal + shippingAmount + shippingTax).toFixed(2));
+
+  const discountPct = basicPrice > 0
+    ? Math.round(((basicPrice - taxableAmount) / basicPrice) * 100)
+    : 0;
+
+  const productGstRate = taxableAmount > 0
+    ? Math.round((productGst / taxableAmount) * 100)
+    : (inv.items && inv.items[0]?.gst_rate ? Number(inv.items[0].gst_rate) : 18);
+
+  const pndGstRate = shippingAmount > 0
+    ? Math.round((shippingTax / shippingAmount) * 100)
+    : 18;
+
+  inv.client_breakdown = {
+    basic_price: basicPrice,
+    discount_amount: totalDiscount,
+    discount_percentage: discountPct,
+    taxable_amount: taxableAmount,
+    product_gst: productGst,
+    product_gst_rate: productGstRate,
+    product_total: productTotal,
+    packing_delivery_charges: shippingAmount,
+    gst_on_pnd: shippingTax,
+    pnd_gst_rate: pndGstRate,
+    final_payable: finalPayable,
+  };
+
+  return inv;
 }
 
 export default InvoiceService;

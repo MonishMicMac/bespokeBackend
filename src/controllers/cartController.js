@@ -32,28 +32,43 @@ export const getCart = async (req, res) => {
         c.measurment_details,
         c.created_at,
         pp.product_id,
+        pp.material_id,
         COALESCE(pp.size, 'Standard') AS size,
         COALESCE(pp.discount_price, pp.actual_price, 499) AS price,
         pp.actual_price,
         pp.discount_price,
+        COALESCE(pp.gst_id, pm.gst_id, p.gst_id, 10) AS gst_id,
+        COALESCE(gm.gst_name, 'IGST 18%') AS gst_name,
+        COALESCE(gm.rate, 'IGST 18%') AS gst_rate,
+        CAST(COALESCE(gm.gst_percentage, 18) AS DECIMAL(5,2)) AS gst_percentage,
         COALESCE(p.product_name, 'Bespoke Atelier Piece') AS title,
         COALESCE(p.product_name, 'Bespoke Atelier Piece') AS product_name,
         COALESCE(
+          (SELECT pmi_sub.img_path FROM product_material_images pmi_sub 
+           WHERE pmi_sub.product_material_id = pp.material_id 
+             AND pmi_sub.img_path IS NOT NULL AND pmi_sub.img_path != '' 
+           ORDER BY pmi_sub.id ASC LIMIT 1),
+          NULLIF(pm.main_img_path, ''),
           NULLIF(p.main_image, ''),
           (SELECT pmi.img_path FROM product_material_images pmi 
            WHERE pmi.product_id = pp.product_id 
              AND pmi.img_path IS NOT NULL AND pmi.img_path != '' 
            ORDER BY pmi.id ASC LIMIT 1),
-          (SELECT pm.main_img_path FROM product_materials pm 
-           WHERE pm.product_id = pp.product_id 
-             AND pm.main_img_path IS NOT NULL AND pm.main_img_path != '' 
-           ORDER BY pm.id ASC LIMIT 1),
           ''
         ) AS image_path,
+        COALESCE(pm.material_name, pm.color_code, '') AS material_name,
+        COALESCE(pm.material_name, pm.color_code, '') AS color,
+        COALESCE(pm.color_code, '') AS color_code,
+        COALESCE(pm.name, '') AS material,
+        COALESCE(pm.name, '') AS fabric,
+        pp.material_id AS material_id,
+        pp.material_id AS materialId,
         COALESCE(v.shop_name, v.username, 'Bespoke Atelier') AS vendor
        FROM user_cart_items c
        LEFT JOIN product_prices pp ON c.price_id = pp.id
        LEFT JOIN products p ON pp.product_id = p.id
+       LEFT JOIN product_materials pm ON pp.material_id = pm.id
+       LEFT JOIN gst_masters gm ON COALESCE(pp.gst_id, pm.gst_id, p.gst_id, 10) = gm.id AND (gm.action IS NULL OR gm.action != '1')
        LEFT JOIN vendor_login v ON v.id = COALESCE(c.vendor_id, p.vendor_id)
        WHERE c.user_id = ? AND c.action = '0'
        ORDER BY c.id DESC`,
@@ -103,6 +118,9 @@ export const getCart = async (req, res) => {
       const itemAddons = addonsMap[item.cart_item_id] || [];
       const addonsTotal = itemAddons.reduce((sum, a) => sum + (a.amount || 0), 0);
       const effectiveUnitPrice = unitPrice + addonsTotal;
+      const gstPct = parseFloat(item.gst_percentage || 0);
+      const gstUnitAmt = gstPct > 0 ? Math.round(((effectiveUnitPrice * gstPct) / 100) * 100) / 100 : 0;
+      const totalItemGst = Math.round((gstUnitAmt * qty) * 100) / 100;
 
       return {
         ...item,
@@ -116,6 +134,12 @@ export const getCart = async (req, res) => {
         quantity: qty,
         addons: itemAddons,
         addons_total: addonsTotal,
+        gst_id: item.gst_id ? Number(item.gst_id) : null,
+        gst_name: item.gst_name || item.gst_rate || null,
+        gst_rate: item.gst_rate || null,
+        gst_percentage: gstPct,
+        gst_amount: gstUnitAmt,
+        total_gst: totalItemGst,
         image:
           formatImageUrl(item.image_path) ||
           "https://images.unsplash.com/photo-1558769132-cb1aea458c5e?auto=format&fit=crop&w=600&q=80",
@@ -125,12 +149,16 @@ export const getCart = async (req, res) => {
 
     const totalCount = formatted.reduce((sum, item) => sum + item.quantity, 0);
     const subtotal = formatted.reduce((sum, item) => sum + item.item_total, 0);
+    const totalGst = formatted.reduce((sum, item) => sum + (item.total_gst || 0), 0);
+    const grandTotal = Math.round((subtotal + totalGst) * 100) / 100;
 
     return res.json({
       status: true,
       data: formatted,
       count: totalCount,
       subtotal,
+      total_gst: totalGst,
+      grand_total: grandTotal,
     });
   } catch (error) {
     console.error("❌ Cart fetch error:", error);
@@ -145,6 +173,8 @@ export const addToCart = async (req, res) => {
       user_id,
       product_id,
       price_id,
+      material_id,
+      materialId,
       quantity = 1,
       size = "Standard",
       vendor_id,
@@ -152,6 +182,8 @@ export const addToCart = async (req, res) => {
       addons = [],
       add_on_id,
     } = req.body;
+
+    const resolvedMaterialId = material_id || materialId || null;
 
     if (!user_id || (!product_id && !price_id)) {
       return res.status(400).json({
@@ -164,23 +196,72 @@ export const addToCart = async (req, res) => {
     let resolvedPriceId = price_id;
     let resolvedVendorId = vendor_id;
 
-    // Resolve price_id from product_prices if missing
-    if (!resolvedPriceId && product_id) {
-      const [matchedPrice] = await sequelize.query(
-        `SELECT id, product_id FROM product_prices 
-         WHERE product_id = ? AND (size = ? OR size IS NULL) 
-         ORDER BY id ASC LIMIT 1`,
+    // If material_id was passed, verify that resolvedPriceId belongs to that material
+    if (resolvedPriceId && resolvedMaterialId) {
+      const [priceCheck] = await sequelize.query(
+        `SELECT id, material_id FROM product_prices WHERE id = ? AND material_id = ? LIMIT 1`,
         {
-          replacements: [product_id, size],
+          replacements: [resolvedPriceId, resolvedMaterialId],
           type: QueryTypes.SELECT,
         }
       );
+      if (!priceCheck) {
+        // Price ID is mismatched or belongs to another material variant!
+        resolvedPriceId = null;
+      }
+    }
+
+    // Resolve price_id from product_prices if missing or invalidated
+    if (!resolvedPriceId && product_id) {
+      let matchedPrice = null;
+
+      if (resolvedMaterialId) {
+        // 1. Try to match product_id, material_id and requested size
+        const [matSizeMatch] = await sequelize.query(
+          `SELECT id FROM product_prices 
+           WHERE product_id = ? AND material_id = ? AND (size = ? OR size IS NULL OR size = '') 
+           ORDER BY (is_out_stock IS NULL OR is_out_stock != '1') DESC, id ASC LIMIT 1`,
+          {
+            replacements: [product_id, resolvedMaterialId, size],
+            type: QueryTypes.SELECT,
+          }
+        );
+        if (matSizeMatch) {
+          matchedPrice = matSizeMatch;
+        } else {
+          // 2. Try to match any price for this material, preferring in-stock
+          const [anyMatPrice] = await sequelize.query(
+            `SELECT id FROM product_prices 
+             WHERE product_id = ? AND material_id = ? 
+             ORDER BY (is_out_stock IS NULL OR is_out_stock != '1') DESC, id ASC LIMIT 1`,
+            {
+              replacements: [product_id, resolvedMaterialId],
+              type: QueryTypes.SELECT,
+            }
+          );
+          matchedPrice = anyMatPrice;
+        }
+      }
+
+      if (!matchedPrice) {
+        // Match by size without material
+        const [genPrice] = await sequelize.query(
+          `SELECT id FROM product_prices 
+           WHERE product_id = ? AND (size = ? OR size IS NULL OR size = '') 
+           ORDER BY (is_out_stock IS NULL OR is_out_stock != '1') DESC, id ASC LIMIT 1`,
+          {
+            replacements: [product_id, size],
+            type: QueryTypes.SELECT,
+          }
+        );
+        matchedPrice = genPrice;
+      }
 
       if (matchedPrice) {
         resolvedPriceId = matchedPrice.id;
       } else {
         const [anyPrice] = await sequelize.query(
-          `SELECT id FROM product_prices WHERE product_id = ? ORDER BY id ASC LIMIT 1`,
+          `SELECT id FROM product_prices WHERE product_id = ? ORDER BY (is_out_stock IS NULL OR is_out_stock != '1') DESC, id ASC LIMIT 1`,
           {
             replacements: [product_id],
             type: QueryTypes.SELECT,
@@ -190,10 +271,10 @@ export const addToCart = async (req, res) => {
           resolvedPriceId = anyPrice.id;
         } else {
           const [insertedPrice] = await sequelize.query(
-            `INSERT INTO product_prices (product_id, size, actual_price, discount_price, qty, is_out_stock, created_at, updated_at)
-             VALUES (?, ?, 500.00, 499.00, 50, '0', NOW(), NOW())`,
+            `INSERT INTO product_prices (product_id, material_id, size, actual_price, discount_price, qty, is_out_stock, created_at, updated_at)
+             VALUES (?, ?, ?, 500.00, 499.00, 50, '0', NOW(), NOW())`,
             {
-              replacements: [product_id, size],
+              replacements: [product_id, resolvedMaterialId, size],
               type: QueryTypes.INSERT,
             }
           );

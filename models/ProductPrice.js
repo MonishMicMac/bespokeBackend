@@ -41,6 +41,10 @@ const ProductPrice = sequelize.define(
       type: DataTypes.TINYINT,
       defaultValue: 0,
     },
+    gst_id: {
+      type: DataTypes.BIGINT,
+      allowNull: true,
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: true,

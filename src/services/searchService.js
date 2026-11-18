@@ -826,10 +826,9 @@ export async function searchProductsWithFacets(params = {}) {
     replacements,
     type: QueryTypes.SELECT,
   });
-  const total = countRes?.total ? parseInt(countRes.total, 10) : 0;
-  const totalPages = Math.max(1, Math.ceil(total / limitNum));
+  const totalRaw = countRes?.total ? parseInt(countRes.total, 10) : 0;
 
-  // 2. Fetch paginated products query (Guaranteed unique parent product per card)
+  // 2. Fetch candidate matching products (up to 100 to expand active variants)
   const productsQuery = `
     SELECT 
       p.id,
@@ -852,11 +851,7 @@ export async function searchProductsWithFacets(params = {}) {
       p.alter_charge,
       p.rating,
       p.created_at,
-      COALESCE(
-        p.main_image,
-        (SELECT pmi.img_path FROM product_material_images pmi WHERE pmi.product_id = p.id AND (pmi.action IS NULL OR pmi.action != '1') ORDER BY pmi.id ASC LIMIT 1),
-        (SELECT pm.main_img_path FROM product_materials pm WHERE pm.product_id = p.id AND (pm.action IS NULL OR pm.action != '1') ORDER BY pm.id ASC LIMIT 1)
-      ) as image_path,
+      p.main_image,
       (
         SELECT COALESCE(MIN(pp.discount_price), MIN(pp.actual_price), 499)
         FROM product_prices pp 
@@ -884,36 +879,39 @@ export async function searchProductsWithFacets(params = {}) {
     ${whereSql}
     GROUP BY p.id
     ORDER BY ${orderBySql}
-    LIMIT ? OFFSET ?
+    LIMIT 100
   `;
 
-  const queryReplacements = [...replacements, limitNum, offset];
-
   const rawProducts = await sequelize.query(productsQuery, {
-    replacements: queryReplacements,
+    replacements,
     type: QueryTypes.SELECT,
   });
 
-  // Auxiliary data: Fetch materials, prices, and sizes for current page products
+  // Auxiliary data: Fetch materials, prices, and sizes for candidate products
   const productIds = rawProducts.map((p) => p.id);
   let materialsMap = {};
   let sizesMap = {};
+  let pricesMap = {};
 
   if (productIds.length > 0) {
     try {
       const [materialsRows, pricesRows] = await Promise.all([
         sequelize.query(
           `SELECT pm.id, pm.product_id, pm.name, pm.material_name, pm.description, pm.main_img_path, mm.name as master_material_name,
-                  (SELECT pmi.img_path FROM product_material_images pmi WHERE pmi.product_material_id = pm.id AND (pmi.action IS NULL OR pmi.action != '1') LIMIT 1) as mat_img
+                  (SELECT pmi.img_path FROM product_material_images pmi WHERE pmi.product_material_id = pm.id AND (pmi.action IS NULL OR pmi.action != '1') ORDER BY pmi.id ASC LIMIT 1) as mat_img
            FROM product_materials pm
            LEFT JOIN material_masters mm ON (pm.name = mm.id OR pm.name = mm.name)
-           WHERE pm.product_id IN (?) AND (pm.action IS NULL OR pm.action != '1')
+           WHERE pm.product_id IN (?) AND (pm.action IS NULL OR pm.action != '1') AND pm.is_active = '1'
            ORDER BY pm.id ASC`,
           { replacements: [productIds], type: QueryTypes.SELECT }
         ),
         sequelize.query(
-          `SELECT DISTINCT product_id, size FROM product_prices 
-           WHERE product_id IN (?) AND size IS NOT NULL AND size != '' AND (is_out_stock IS NULL OR is_out_stock != '1')`,
+          `SELECT pp.id, pp.material_id, pp.product_id, pp.size, pp.discount_price, pp.actual_price, pp.is_out_stock, pp.qty, pp.gst_id,
+                  gm.gst_name, gm.rate AS gst_rate, CAST(COALESCE(gm.gst_percentage, 0) AS DECIMAL(5,2)) AS gst_percentage 
+           FROM product_prices pp 
+           LEFT JOIN gst_masters gm ON pp.gst_id = gm.id AND (gm.action IS NULL OR gm.action != '1')
+           WHERE pp.product_id IN (?) 
+           ORDER BY pp.id ASC`,
           { replacements: [productIds], type: QueryTypes.SELECT }
         ),
       ]);
@@ -930,9 +928,14 @@ export async function searchProductsWithFacets(params = {}) {
       });
 
       pricesRows.forEach((pr) => {
-        if (!sizesMap[pr.product_id]) sizesMap[pr.product_id] = [];
-        if (!sizesMap[pr.product_id].includes(pr.size)) {
-          sizesMap[pr.product_id].push(pr.size);
+        if (!pricesMap[pr.product_id]) pricesMap[pr.product_id] = [];
+        pricesMap[pr.product_id].push(pr);
+
+        if (pr.size && pr.size.trim()) {
+          if (!sizesMap[pr.product_id]) sizesMap[pr.product_id] = [];
+          if (!sizesMap[pr.product_id].includes(pr.size.trim())) {
+            sizesMap[pr.product_id].push(pr.size.trim());
+          }
         }
       });
     } catch (auxErr) {
@@ -940,21 +943,24 @@ export async function searchProductsWithFacets(params = {}) {
     }
   }
 
-  // Format final product cards
-  const formattedProducts = rawProducts.map((p) => {
+  // Expand products into variant cards
+  const expandedFormatted = [];
+
+  rawProducts.forEach((p) => {
     const pMaterials = materialsMap[p.id] || [];
+    const pPrices = pricesMap[p.id] || [];
     const pSizes = sizesMap[p.id] || [];
-    const fullImg = formatImageUrl(p.image_path) || "https://images.unsplash.com/photo-1521572267360-ee0c2909d518?auto=format&fit=crop&w=600&q=80";
+    const fullImg = formatImageUrl(p.main_image) || "https://images.unsplash.com/photo-1521572267360-ee0c2909d518?auto=format&fit=crop&w=600&q=80";
     const priceVal = parseFloat(p.effective_price || p.original_price || 499);
     const origVal = parseFloat(p.original_price || priceVal);
     const discountVal = parseInt(p.discount_pct || 0, 10);
 
     const allText = `${p.product_name} ${p.description || ""} ${pMaterials.map((m) => `${m.name} ${m.material_name}`).join(" ")}`;
-    const fabrics = extractFabrics(allText, pMaterials);
-    const colors = extractColors(allText, pMaterials);
+    const baseFabrics = extractFabrics(allText, pMaterials);
+    const baseColors = extractColors(allText, pMaterials);
     const occasions = extractOccasions(allText, p.category_name, p.subcategory_name);
 
-    return {
+    const baseProduct = {
       id: p.id,
       product_id: p.id,
       title: p.product_name,
@@ -980,16 +986,265 @@ export async function searchProductsWithFacets(params = {}) {
       rating: parseFloat(p.rating || 4.8),
       rating_count: 15,
       sizes: pSizes,
-      fabrics,
-      fabric: fabrics[0] || "Cotton",
-      colors,
-      color: colors[0] || "Multicolor",
+      fabrics: baseFabrics,
+      fabric: baseFabrics[0] || "Cotton",
+      colors: baseColors,
+      color: baseColors[0] || "Multicolor",
       occasions,
       occasion: occasions[0] || "Festive",
       materials: pMaterials,
-      variant_name: pMaterials[0]?.material_name || null,
     };
+
+    if (pMaterials.length > 0) {
+      pMaterials.forEach((mat, mIdx) => {
+        // Find best in-stock price for this variant
+        const matPrices = pPrices.filter((pr) => pr.material_id === mat.id);
+        const inStockPrices = matPrices.filter((pr) => pr.is_out_stock !== "1" && pr.is_out_stock !== 1);
+        const eligiblePrices = inStockPrices.length > 0 ? inStockPrices : matPrices;
+
+        let bestDisc = 0;
+        let bestAct = 0;
+        let bestPriceId = null;
+        let bestGstId = null;
+        let bestGstName = null;
+        let bestGstPct = 0;
+        let bestGstRate = null;
+        const matSizes = [];
+
+        eligiblePrices.forEach((mp) => {
+          if (mp.size && !matSizes.includes(mp.size.trim())) matSizes.push(mp.size.trim());
+          const d = parseFloat(mp.discount_price) || 0;
+          const a = parseFloat(mp.actual_price) || 0;
+          if (!bestPriceId) {
+            bestPriceId = mp.id;
+            bestGstId = mp.gst_id;
+            bestGstName = mp.gst_name;
+            bestGstPct = parseFloat(mp.gst_percentage || 0);
+            bestGstRate = mp.gst_rate;
+          }
+          if (d > 0 && (bestDisc === 0 || d < bestDisc)) {
+            bestDisc = d;
+            bestPriceId = mp.id;
+            bestGstId = mp.gst_id;
+            bestGstName = mp.gst_name;
+            bestGstPct = parseFloat(mp.gst_percentage || 0);
+            bestGstRate = mp.gst_rate;
+          }
+          if (a > 0 && (bestAct === 0 || a < bestAct)) {
+            bestAct = a;
+            if (!bestPriceId) {
+              bestPriceId = mp.id;
+              bestGstId = mp.gst_id;
+              bestGstName = mp.gst_name;
+              bestGstPct = parseFloat(mp.gst_percentage || 0);
+              bestGstRate = mp.gst_rate;
+            }
+          }
+        });
+
+        if (!bestPriceId && matPrices.length > 0) {
+          bestPriceId = matPrices[0].id;
+          bestGstId = matPrices[0].gst_id;
+          bestGstName = matPrices[0].gst_name;
+          bestGstPct = parseFloat(matPrices[0].gst_percentage || 0);
+          bestGstRate = matPrices[0].gst_rate;
+        }
+
+        const variantPrice = bestDisc > 0 ? bestDisc : (bestAct > 0 ? bestAct : priceVal);
+        const variantOrig = bestAct > 0 ? bestAct : (bestDisc > 0 ? bestDisc : origVal);
+        const variantDiscount =
+          variantOrig > variantPrice && variantOrig > 0
+            ? Math.round(((variantOrig - variantPrice) / variantOrig) * 100)
+            : discountVal;
+
+        const variantImg = mat.image || fullImg;
+
+        // Variant fabrics
+        const variantFabrics = [];
+        KNOWN_FABRICS.forEach((f) => {
+          if ((mat.name || "").toLowerCase().includes(f.toLowerCase()) || (mat.material_name || "").toLowerCase().includes(f.toLowerCase())) {
+            const cap = f.charAt(0).toUpperCase() + f.slice(1);
+            if (!variantFabrics.includes(cap)) variantFabrics.push(cap);
+          }
+        });
+        if (variantFabrics.length === 0) variantFabrics.push(...baseFabrics);
+
+        // Variant colors
+        const variantColors = [];
+        KNOWN_COLORS.forEach((c) => {
+          if ((mat.name || "").toLowerCase().includes(c.toLowerCase()) || (mat.material_name || "").toLowerCase().includes(c.toLowerCase())) {
+            const cap = c.charAt(0).toUpperCase() + c.slice(1);
+            if (!variantColors.includes(cap)) variantColors.push(cap);
+          }
+        });
+        if (variantColors.length === 0 && mat.material_name && isNaN(mat.material_name) && !["test", "ready", "both", "sdac"].includes(mat.material_name.toLowerCase())) {
+          const cap = mat.material_name.charAt(0).toUpperCase() + mat.material_name.slice(1);
+          variantColors.push(cap);
+        }
+        if (variantColors.length === 0) variantColors.push(...baseColors);
+
+        // Variant name
+        let variantName = mat.material_name || "";
+        if (!isNaN(variantName) && mat.name && isNaN(mat.name)) variantName = mat.name;
+        if (!variantName || ["test", "ready", "both", "sdac"].includes(variantName.toLowerCase())) {
+          variantName = variantColors[0] || variantFabrics[0] || "";
+        }
+
+        const displayTitle =
+          (pMaterials.length > 1 && variantName && !p.product_name.toLowerCase().includes(variantName.toLowerCase()))
+            ? `${p.product_name} - ${variantName}`
+            : p.product_name;
+
+        expandedFormatted.push({
+          ...baseProduct,
+          unique_id: `${p.id}-${mat.id}`,
+          variant_id: mat.id,
+          material_id: mat.id,
+          selectedMaterialId: mat.id,
+          selectedMaterialIdx: mIdx,
+          price_id: bestPriceId || p.price_id,
+          priceId: bestPriceId || p.price_id,
+          title: displayTitle,
+          name: displayTitle,
+          variant_name: variantName,
+          material_name: mat.material_name || "",
+          image: variantImg,
+          main_image: variantImg,
+          images: [variantImg],
+          price: variantPrice,
+          original_price: variantOrig,
+          discount_percentage: variantDiscount,
+          discount_label: variantDiscount > 0 ? `${variantDiscount}% OFF` : null,
+          gst_id: bestGstId ? Number(bestGstId) : null,
+          gst_name: bestGstName || null,
+          gst_percentage: bestGstPct || 0,
+          gst_rate: bestGstRate || null,
+          sizes: matSizes.length > 0 ? matSizes : pSizes,
+          fabrics: variantFabrics,
+          fabric: variantFabrics[0] || "Cotton",
+          colors: variantColors,
+          color: variantColors[0] || "Multicolor",
+        });
+      });
+    } else {
+      expandedFormatted.push({
+        ...baseProduct,
+        unique_id: String(p.id),
+      });
+    }
   });
+
+  // Filter expanded variants by color, fabric, or explicit query colors
+  let filteredVariants = expandedFormatted;
+
+  // 1. Color filter parameter
+  if (color) {
+    const requestedColors = String(color)
+      .split(",")
+      .map((c) => c.trim().toLowerCase())
+      .filter(Boolean);
+    if (requestedColors.length > 0) {
+      filteredVariants = filteredVariants.filter((item) => {
+        const itemColors = (item.colors || [item.color]).map((c) => String(c).toLowerCase());
+        const itemVariantName = (item.variant_name || "").toLowerCase();
+        const itemTitle = (item.title || "").toLowerCase();
+        return requestedColors.some(
+          (rc) =>
+            itemColors.some((ic) => ic.includes(rc) || rc.includes(ic)) ||
+            itemVariantName.includes(rc) ||
+            itemTitle.includes(rc)
+        );
+      });
+    }
+  }
+
+  // 2. Fabric filter parameter
+  if (fabric) {
+    const requestedFabrics = String(fabric)
+      .split(",")
+      .map((f) => f.trim().toLowerCase())
+      .filter(Boolean);
+    if (requestedFabrics.length > 0) {
+      filteredVariants = filteredVariants.filter((item) => {
+        const itemFabrics = (item.fabrics || [item.fabric]).map((f) => String(f).toLowerCase());
+        const itemVariantName = (item.variant_name || "").toLowerCase();
+        const itemTitle = (item.title || "").toLowerCase();
+        return requestedFabrics.some(
+          (rf) =>
+            itemFabrics.some((ifab) => ifab.includes(rf) || rf.includes(ifab)) ||
+            itemVariantName.includes(rf) ||
+            itemTitle.includes(rf)
+        );
+      });
+    }
+  }
+
+  // 3. Explicit color keyword in search query (e.g. "blue saree" -> show only blue variants)
+  if (cleanQ && !color) {
+    const qTokens = cleanQ.toLowerCase().split(/[\s,+/_-]+/).filter(Boolean);
+    const queryColorTokens = qTokens.filter((tok) => KNOWN_COLORS.some((kc) => kc.toLowerCase() === tok));
+    if (queryColorTokens.length > 0) {
+      const colorMatches = filteredVariants.filter((item) => {
+        const itemColors = (item.colors || [item.color]).map((c) => String(c).toLowerCase());
+        const itemVariantName = (item.variant_name || "").toLowerCase();
+        return queryColorTokens.some((qc) =>
+          itemColors.some((ic) => ic.includes(qc) || qc.includes(ic)) || itemVariantName.includes(qc)
+        );
+      });
+      if (colorMatches.length > 0) {
+        filteredVariants = colorMatches;
+      }
+    }
+  }
+
+  // 4. Explicit fabric keyword in search query (e.g. "silk saree" -> show only silk variants)
+  if (cleanQ && !fabric) {
+    const qTokens = cleanQ.toLowerCase().split(/[\s,+/_-]+/).filter(Boolean);
+    const queryFabricTokens = qTokens.filter((tok) => KNOWN_FABRICS.some((kf) => kf.toLowerCase() === tok));
+    if (queryFabricTokens.length > 0) {
+      const fabricMatches = filteredVariants.filter((item) => {
+        const itemFabrics = (item.fabrics || [item.fabric]).map((f) => String(f).toLowerCase());
+        const itemVariantName = (item.variant_name || "").toLowerCase();
+        return queryFabricTokens.some((qf) =>
+          itemFabrics.some((ifa) => ifa.includes(qf) || qf.includes(ifa)) || itemVariantName.includes(qf)
+        );
+      });
+      if (fabricMatches.length > 0) {
+        filteredVariants = fabricMatches;
+      }
+    }
+  }
+
+  // Sort expanded variants
+  switch (sort) {
+    case "price_asc":
+    case "price-low":
+      filteredVariants.sort((a, b) => (parseFloat(a.price) || 0) - (parseFloat(b.price) || 0));
+      break;
+    case "price_desc":
+    case "price-high":
+      filteredVariants.sort((a, b) => (parseFloat(b.price) || 0) - (parseFloat(a.price) || 0));
+      break;
+    case "newest":
+    case "new_arrivals":
+      filteredVariants.sort((a, b) => (b.id || 0) - (a.id || 0));
+      break;
+    case "discount":
+    case "highest_discount":
+      filteredVariants.sort((a, b) => (b.discount_percentage || 0) - (a.discount_percentage || 0));
+      break;
+    case "rating":
+      filteredVariants.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+      break;
+    case "recommended":
+    default:
+      // Keep relevant order
+      break;
+  }
+
+  const total = filteredVariants.length;
+  const totalPages = Math.max(1, Math.ceil(total / limitNum));
+  const formattedProducts = filteredVariants.slice(offset, offset + limitNum);
 
   // 3. Dynamic Facets Generation across all matching items
   const facetsQuery = `
@@ -1045,20 +1300,34 @@ export async function searchProductsWithFacets(params = {}) {
   let readyMadeCount = 0;
 
   facetProducts.forEach((p) => {
-    // Categories
+    // Categories - Deduplicated by normalized name
     if (p.category_id && p.category_name) {
-      if (!catCountMap[p.category_id]) {
-        catCountMap[p.category_id] = { id: p.category_id, name: p.category_name, count: 0 };
+      const normCatName = p.category_name.trim();
+      const key = normCatName.toLowerCase();
+      if (!catCountMap[key]) {
+        catCountMap[key] = { id: String(p.category_id), ids: [String(p.category_id)], name: normCatName, count: 0 };
+      } else {
+        if (!catCountMap[key].ids.includes(String(p.category_id))) {
+          catCountMap[key].ids.push(String(p.category_id));
+          catCountMap[key].id = catCountMap[key].ids.join(",");
+        }
       }
-      catCountMap[p.category_id].count++;
+      catCountMap[key].count++;
     }
 
-    // Subcategories / Styles
+    // Subcategories / Styles - Deduplicated by normalized name
     if (p.subcategory_id && p.subcategory_name) {
-      if (!subcatCountMap[p.subcategory_id]) {
-        subcatCountMap[p.subcategory_id] = { id: p.subcategory_id, name: p.subcategory_name, count: 0 };
+      const normSubName = p.subcategory_name.trim();
+      const key = normSubName.toLowerCase();
+      if (!subcatCountMap[key]) {
+        subcatCountMap[key] = { id: String(p.subcategory_id), ids: [String(p.subcategory_id)], name: normSubName, count: 0 };
+      } else {
+        if (!subcatCountMap[key].ids.includes(String(p.subcategory_id))) {
+          subcatCountMap[key].ids.push(String(p.subcategory_id));
+          subcatCountMap[key].id = subcatCountMap[key].ids.join(",");
+        }
       }
-      subcatCountMap[p.subcategory_id].count++;
+      subcatCountMap[key].count++;
     }
 
     // Brands

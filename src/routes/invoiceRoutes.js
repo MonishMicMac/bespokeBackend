@@ -19,8 +19,13 @@ router.get("/customer/invoices/:invoiceId/download", InvoiceController.downloadI
 router.get("/customer/orders/:orderId/invoice", InvoiceController.getOrderInvoice);
 router.get("/customer/orders/:orderId/invoices", InvoiceController.getOrderInvoice);
 
-// Download invoice PDF for a specific order
+// Retrieve invoice(s) for a specific sale order
+router.get("/customer/sale-orders/:saleOrderId/invoice", InvoiceController.getOrderInvoice);
+router.get("/customer/sale-orders/:saleOrderId/invoices", InvoiceController.getOrderInvoice);
+
+// Download invoice PDF for a specific order or sale order
 router.get("/customer/orders/:orderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
+router.get("/customer/sale-orders/:saleOrderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
 
 // Explicit generate invoice for an order
 router.post("/customer/orders/:orderId/invoice/generate", InvoiceController.getOrderInvoice);
@@ -46,6 +51,8 @@ router.get("/invoices/:invoiceId", InvoiceController.getInvoiceDetails);
 router.get("/invoices/:invoiceId/download", InvoiceController.downloadInvoicePdf);
 router.get("/orders/:orderId/invoice", InvoiceController.getOrderInvoice);
 router.get("/orders/:orderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
+router.get("/sale-orders/:saleOrderId/invoice", InvoiceController.getOrderInvoice);
+router.get("/sale-orders/:saleOrderId/invoice/download", InvoiceController.downloadOrderInvoicePdf);
 
 export default router;
 

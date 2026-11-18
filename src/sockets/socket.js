@@ -603,6 +603,33 @@ export function initSocket(io) {
             messageText: data.message,
           }).catch((e) => console.warn("Notice: socket customer support reply notif error:", e.message));
         } else {
+          // Customer replied: mark earlier admin messages on this ticket as seen & support notifs as read
+          const cleanCustIdNum = parseInt(cleanSender.replace(/[^0-9]/g, ""), 10) || 76;
+          TicketMessage.update(
+            { seen_at: new Date() },
+            {
+              where: {
+                ticket_id: ticket.id,
+                receiver_id: cleanCustIdNum,
+                seen_at: null,
+              },
+            }
+          ).catch(() => {});
+
+          Notification.update(
+            { is_read: true, read_at: new Date() },
+            {
+              where: {
+                recipient_type: "user",
+                recipient_id: { [Op.in]: [String(cleanCustIdNum), `customer_${cleanCustIdNum}`, `user_${cleanCustIdNum}`] },
+                related_ticket_id: ticket.id,
+                is_read: false,
+              },
+            }
+          ).catch(() => {});
+
+          emitToUser(String(cleanCustIdNum), "unread_count:update", { unread_count: 0 });
+
           NotificationService.notifyAdminNewSupportMessage({
             ticket,
             customerId: cleanSender,

@@ -208,7 +208,14 @@ export const getProducts = async (req, res) => {
         );
 
         const [allPricesWithMat] = await sequelize.query(
-          `SELECT material_id, product_id, size, discount_price, actual_price FROM product_prices WHERE product_id IN (?) AND (is_out_stock IS NULL OR is_out_stock != '1')`,
+          `SELECT pp.id, pp.material_id, pp.product_id, pp.size, pp.discount_price, pp.actual_price, pp.is_out_stock, pp.qty,
+                  COALESCE(pp.gst_id, 10) AS gst_id,
+                  COALESCE(gm.gst_name, 'IGST 18%') AS gst_name,
+                  COALESCE(gm.rate, 'IGST 18%') AS gst_rate,
+                  CAST(COALESCE(gm.gst_percentage, 18) AS DECIMAL(5,2)) AS gst_percentage
+           FROM product_prices pp
+           LEFT JOIN gst_masters gm ON COALESCE(pp.gst_id, 10) = gm.id AND (gm.action IS NULL OR gm.action != '1')
+           WHERE pp.product_id IN (?)`,
           { replacements: [productIds] }
         );
 
@@ -217,17 +224,63 @@ export const getProducts = async (req, res) => {
           const mSizes = [];
           let bestDisc = parseFloat(row.discount_price) || 0;
           let bestAct = parseFloat(row.actual_price) || 0;
-          allPricesWithMat.filter((mp) => mp.material_id === row.id).forEach((mp) => {
+          let bestPriceId = null;
+          let bestGstId = null;
+          let bestGstName = null;
+          let bestGstPct = 0;
+          let bestGstRate = null;
+
+          const matPrices = allPricesWithMat.filter((mp) => mp.material_id === row.id);
+          const inStockPrices = matPrices.filter((mp) => mp.is_out_stock !== "1" && mp.is_out_stock !== 1);
+          const eligiblePrices = inStockPrices.length > 0 ? inStockPrices : matPrices;
+
+          eligiblePrices.forEach((mp) => {
             if (mp.size && !mSizes.includes(mp.size)) mSizes.push(mp.size);
             const d = parseFloat(mp.discount_price) || 0;
             const a = parseFloat(mp.actual_price) || 0;
-            if (d > 0 && (bestDisc === 0 || d < bestDisc)) bestDisc = d;
-            if (a > 0 && (bestAct === 0 || a < bestAct)) bestAct = a;
+            if (!bestPriceId) {
+              bestPriceId = mp.id;
+              bestGstId = mp.gst_id;
+              bestGstName = mp.gst_name;
+              bestGstPct = parseFloat(mp.gst_percentage || 0);
+              bestGstRate = mp.gst_rate;
+            }
+            if (d > 0 && (bestDisc === 0 || d < bestDisc)) {
+              bestDisc = d;
+              bestPriceId = mp.id;
+              bestGstId = mp.gst_id;
+              bestGstName = mp.gst_name;
+              bestGstPct = parseFloat(mp.gst_percentage || 0);
+              bestGstRate = mp.gst_rate;
+            }
+            if (a > 0 && (bestAct === 0 || a < bestAct)) {
+              bestAct = a;
+              if (!bestPriceId) {
+                bestPriceId = mp.id;
+                bestGstId = mp.gst_id;
+                bestGstName = mp.gst_name;
+                bestGstPct = parseFloat(mp.gst_percentage || 0);
+                bestGstRate = mp.gst_rate;
+              }
+            }
           });
+
+          if (!bestPriceId && matPrices.length > 0) {
+            bestPriceId = matPrices[0].id;
+            bestGstId = matPrices[0].gst_id;
+            bestGstName = matPrices[0].gst_name;
+            bestGstPct = parseFloat(matPrices[0].gst_percentage || 0);
+            bestGstRate = matPrices[0].gst_rate;
+          }
 
           materialMap[row.product_id].push({
             id: row.id,
             material_id: row.id,
+            price_id: bestPriceId,
+            gst_id: bestGstId ? Number(bestGstId) : null,
+            gst_name: bestGstName,
+            gst_percentage: bestGstPct,
+            gst_rate: bestGstRate,
             product_id: row.product_id,
             name: row.name || "",
             material_name: row.material_name || "",
@@ -445,6 +498,8 @@ export const getProducts = async (req, res) => {
             material_id: mat.id,
             selectedMaterialId: mat.id,
             selectedMaterialIdx: mIdx,
+            price_id: mat.price_id || baseProd.price_id,
+            priceId: mat.price_id || baseProd.price_id,
             title: displayTitle,
             name: displayTitle,
             variant_name: variantName,
@@ -456,6 +511,10 @@ export const getProducts = async (req, res) => {
             original_price: variantOrig,
             discount_percentage: variantDiscount,
             discount_label: variantDiscount > 0 ? `${variantDiscount}% OFF` : null,
+            gst_id: mat.gst_id ? Number(mat.gst_id) : (baseProd.gst_id ? Number(baseProd.gst_id) : null),
+            gst_name: mat.gst_name || null,
+            gst_percentage: parseFloat(mat.gst_percentage || 0),
+            gst_rate: mat.gst_rate || null,
             sizes: mat.sizes?.length > 0 ? mat.sizes : pSizes,
             fabrics: variantFabrics,
             fabric: variantFabrics[0] || "Cotton",
@@ -553,9 +612,17 @@ export const getProductById = async (req, res) => {
       });
     }
 
-    // Fetch prices with size breakdown
+    // Fetch prices with size breakdown and GST details
     const prices = await sequelize.query(
-      `SELECT * FROM product_prices WHERE product_id = ? ORDER BY discount_price ASC`,
+      `SELECT pp.*,
+              COALESCE(pp.gst_id, 10) AS gst_id,
+              COALESCE(gm.gst_name, 'IGST 18%') AS gst_name,
+              COALESCE(gm.rate, 'IGST 18%') AS gst_rate,
+              CAST(COALESCE(gm.gst_percentage, 18) AS DECIMAL(5,2)) AS gst_percentage
+       FROM product_prices pp
+       LEFT JOIN gst_masters gm ON COALESCE(pp.gst_id, 10) = gm.id AND (gm.action IS NULL OR gm.action != '1')
+       WHERE pp.product_id = ? 
+       ORDER BY pp.discount_price ASC`,
       { replacements: [productId], type: QueryTypes.SELECT }
     );
 
@@ -629,6 +696,10 @@ export const getProductById = async (req, res) => {
           original_price: actual,
           qty: p.qty || 0,
           in_stock: String(p.is_out_stock) !== "1",
+          gst_id: p.gst_id ? Number(p.gst_id) : null,
+          gst_name: p.gst_name || null,
+          gst_rate: p.gst_rate || null,
+          gst_percentage: parseFloat(p.gst_percentage || 0),
         });
       }
     });
@@ -677,14 +748,33 @@ export const getProductById = async (req, res) => {
       });
     }
 
-    // Materials details
-    const formattedMaterials = materials.map((m) => ({
-      id: m.id,
-      name: m.name,
-      material_name: m.material_name,
-      description: m.description,
-      image: formatImageUrl(m.main_img_path),
-    }));
+    // Materials details with material-specific images, prices and price_ids
+    const formattedMaterials = materials.map((m) => {
+      const mImgs = matImages.filter((mi) => mi.product_material_id === m.id);
+      const primaryImg = mImgs[0]?.img_path || m.main_img_path || null;
+      const mPrices = prices.filter((p) => p.material_id === m.id);
+      const readyMade = mPrices.filter((p) => p.product_type === 1 || p.product_type === '1' || !p.product_type);
+      const customizable = mPrices.filter((p) => p.product_type === 0 || p.product_type === '0');
+      const inStockPrice = mPrices.find((p) => p.is_out_stock !== '1' && p.is_out_stock !== 1);
+      const bestPriceId = inStockPrice?.id || mPrices[0]?.id || null;
+
+      return {
+        id: m.id,
+        material_id: m.id,
+        name: m.name,
+        material_name: m.material_name,
+        description: m.description,
+        main_img_path: primaryImg,
+        image: formatImageUrl(primaryImg),
+        images: mImgs.map((mi) => ({ id: mi.id, img_path: mi.img_path, url: formatImageUrl(mi.img_path) })),
+        prices: {
+          ready_made_products: readyMade.length > 0 ? readyMade : mPrices,
+          customizable_products: customizable,
+        },
+        all_prices: mPrices,
+        price_id: bestPriceId,
+      };
+    });
 
     // Vendor details
     const brand =
@@ -778,6 +868,7 @@ export const getProductById = async (req, res) => {
       available_sizes: availableSizes,
       materials: formattedMaterials,
       specifications,
+      product_info: infoItems,
       raw_info: infoItems,
       size_details: sizeDetails,
       vendor: vendorDetails,

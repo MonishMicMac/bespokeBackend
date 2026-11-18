@@ -26,6 +26,7 @@ import {
   UserCartItem,
   Category,
   Subcategory,
+  GstMaster,
 } from "../../models/setupAssociations.js";
 import { buildFileUrl } from "../utils/fileUrl.js";
 import { searchMeilisearch } from "../utils/meilisearch.js";
@@ -553,6 +554,26 @@ export async function getProductDetails(productId, userId = null) {
 
   const productJson = product.toJSON();
 
+  // Load GST Masters for rate enrichment
+  let gstMasters = [];
+  try {
+    gstMasters = await GstMaster.findAll({
+      where: { [Op.or]: [{ action: "0" }, { action: null }] },
+      raw: true,
+    });
+  } catch (e) {
+    console.warn("Could not load gst_masters:", e.message);
+  }
+  const defaultGst = gstMasters.find((g) => Number(g.id) === 10) ||
+    gstMasters[0] || { id: 10, gst_name: "IGST 18%", rate: "IGST 18%", gst_percentage: 18 };
+  const gstMap = new Map(gstMasters.map((g) => [Number(g.id), g]));
+
+  const topGst = gstMap.get(Number(productJson.gst_id)) || defaultGst;
+  productJson.gst_id = Number(topGst.id);
+  productJson.gst_name = topGst.gst_name || topGst.rate || "IGST 18%";
+  productJson.gst_rate = topGst.rate || "IGST 18%";
+  productJson.gst_percentage = parseFloat(topGst.gst_percentage || 18);
+
   // Sort relations by id ASC (matching Laravel Eloquent default order)
   if (productJson.productInfo) {
     productJson.productInfo.sort((a, b) => a.id - b.id);
@@ -560,7 +581,16 @@ export async function getProductDetails(productId, userId = null) {
   if (productJson.productMaterials) {
     productJson.productMaterials.sort((a, b) => a.id - b.id);
     productJson.productMaterials.forEach((mat) => {
-      if (mat.prices) mat.prices.sort((a, b) => a.id - b.id);
+      if (mat.prices) {
+        mat.prices.sort((a, b) => a.id - b.id);
+        mat.prices.forEach((p) => {
+          const matchedGst = gstMap.get(Number(p.gst_id)) || defaultGst;
+          p.gst_id = Number(matchedGst.id);
+          p.gst_name = matchedGst.gst_name || matchedGst.rate || "IGST 18%";
+          p.gst_rate = matchedGst.rate || "IGST 18%";
+          p.gst_percentage = parseFloat(matchedGst.gst_percentage || 18);
+        });
+      }
       if (mat.images) mat.images.sort((a, b) => a.id - b.id);
       if (mat.addons) mat.addons.sort((a, b) => a.id - b.id);
     });

@@ -2,6 +2,7 @@ import "../../models/setupAssociations.js";
 import Message from "../../models/index.js";
 import Ticket from "../../models/Ticket.js";
 import TicketMessage from "../../models/TicketMessage.js";
+import Notification from "../../models/Notification.js";
 import VendorLogin from "../../models/VendorLogin.js";
 import UserLogin from "../../models/UserLogin.js";
 import SaleOrder from "../../models/SaleOrder.js";
@@ -96,6 +97,45 @@ export const getChatHistory = async (req, res) => {
 
     // Reverse them to be in chronological order for the frontend
     messages.reverse();
+
+    // Auto-mark incoming messages from otherUserId as read when viewing chat
+    const safeCId = parseInt(String(userId).replace(/[^0-9]/g, ""), 10);
+    if (safeCId) {
+      Message.update(
+        { isRead: true, status: "read" },
+        {
+          where: {
+            senderId: { [Op.in]: otherVariations },
+            receiverId: { [Op.in]: userVariations },
+            isRead: false,
+          },
+        }
+      ).catch(() => {});
+
+      TicketMessage.update(
+        { seen_at: new Date() },
+        {
+          where: {
+            receiver_id: safeCId,
+            seen_at: null,
+          },
+        }
+      ).catch(() => {});
+
+      Notification.update(
+        { is_read: true, read_at: new Date() },
+        {
+          where: {
+            recipient_type: "user",
+            recipient_id: { [Op.in]: [String(safeCId), `customer_${safeCId}`, `user_${safeCId}`] },
+            type: { [Op.in]: ["support", "chat"] },
+            is_read: false,
+          },
+        }
+      ).catch(() => {});
+
+      emitToUser(String(safeCId), "unread_count:update", { unread_count: 0 });
+    }
 
     const formattedMessages = messages.map((msg) => {
       const msgData = msg.toJSON ? msg.toJSON() : { ...msg };
@@ -698,6 +738,46 @@ export const sendMessage = async (req, res) => {
       temp_id: resolvedTempId,
       tempId: resolvedTempId,
     };
+
+    // If customer is sending message, mark all prior admin messages as seen/read
+    const cleanSenderNum = parseInt(cleanSenderStr.replace(/[^0-9]/g, ""), 10);
+    const isSenderAdmin = cleanSenderStr === "1" || cleanSenderStr.toLowerCase().includes("admin") || String(senderType).toLowerCase() === "admin";
+    if (cleanSenderNum && !isSenderAdmin) {
+      Message.update(
+        { isRead: true, status: "read" },
+        {
+          where: {
+            senderId: { [Op.in]: ["1", "admin", "admin_1"] },
+            receiverId: { [Op.in]: [String(cleanSenderNum), `customer_${cleanSenderNum}`, `user_${cleanSenderNum}`] },
+            isRead: false,
+          },
+        }
+      ).catch(() => {});
+
+      TicketMessage.update(
+        { seen_at: new Date() },
+        {
+          where: {
+            receiver_id: cleanSenderNum,
+            seen_at: null,
+          },
+        }
+      ).catch(() => {});
+
+      Notification.update(
+        { is_read: true, read_at: new Date() },
+        {
+          where: {
+            recipient_type: "user",
+            recipient_id: { [Op.in]: [String(cleanSenderNum), `customer_${cleanSenderNum}`, `user_${cleanSenderNum}`] },
+            type: { [Op.in]: ["support", "chat"] },
+            is_read: false,
+          },
+        }
+      ).catch(() => {});
+
+      emitToUser(String(cleanSenderNum), "unread_count:update", { unread_count: 0 });
+    }
 
     // If receiver is admin or 1, emit to admin channel
     const cleanRId = String(receiverId).replace(/^(customer_|vendor_|admin_)/, "");

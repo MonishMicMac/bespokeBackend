@@ -271,6 +271,7 @@ class OrderService {
       let totalAddon = 0;
       let totalMaterial = 0;
       let totalAlter = 0;
+      let totalGst = 0;
       const createdSaleOrders = [];
 
       // 4. Process Each Product
@@ -443,12 +444,38 @@ class OrderService {
           { transaction: t }
         );
 
+        // Resolve GST from gst_masters using gst_id
+        const resolvedGstId =
+          priceRow.gst_id ||
+          (materialId ? (await ProductMaterial.findByPk(materialId, { transaction: t }))?.gst_id : null) ||
+          product.gst_id ||
+          10;
+
+        let itemGstPercentage = 0;
+        let itemGstName = null;
+        if (resolvedGstId) {
+          const [gstRows] = await sequelize.query(
+            "SELECT id, gst_name, rate, gst_percentage FROM gst_masters WHERE id = ? AND (action IS NULL OR action != '1') LIMIT 1",
+            { replacements: [resolvedGstId], transaction: t }
+          );
+          if (gstRows && gstRows.length > 0) {
+            itemGstPercentage = parseFloat(gstRows[0].gst_percentage || 0);
+            itemGstName = gstRows[0].gst_name || gstRows[0].rate || null;
+          }
+        }
+
+        const itemGstAmount =
+          itemGstPercentage > 0
+            ? Math.round(((itemTotal * itemGstPercentage) / 100) * 100) / 100
+            : 0;
+
         createdSaleOrders.push(saleOrder);
 
         totalPrice += singlePrice * qty;
         totalAddon += addonPrice;
         totalMaterial += materialPrice;
         totalAlter += alterAmount;
+        totalGst += itemGstAmount;
       }
 
       // 5. Calculate SubTotal & Promo Discount
@@ -481,12 +508,12 @@ class OrderService {
 
       // Delivery Charges from DB
       const deliveryAmount = await OrderPricingService.getDeliveryCharge();
-      const finalPayable = Math.max(0, pricing.payable + deliveryAmount);
+      const finalPayable = Math.max(0, Math.round((pricing.payable + totalGst + deliveryAmount) * 100) / 100);
 
       // Update Main Order
       await order.update(
         {
-          price: subTotal,
+          price: Math.round((subTotal + totalGst) * 100) / 100,
           discount_amt: String(pricing.discount),
           delivery_amount: deliveryAmount,
           payable_price: finalPayable,
